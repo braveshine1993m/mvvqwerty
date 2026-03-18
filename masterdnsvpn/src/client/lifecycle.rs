@@ -27,6 +27,7 @@ use super::connection;
 use super::health;
 use super::mtu;
 use super::queue;
+use super::recommendations;
 use super::retransmit;
 use super::rx;
 use super::session;
@@ -90,7 +91,38 @@ pub async fn run() {
         state.session_established.store(false, Ordering::SeqCst);
         state.session_id.store(0, Ordering::SeqCst);
 
-        // --- run_client() logic ---
+        // --- run_client() logic (mirrors Python run_client) ---
+        // Reset tunnel runtime state (mirrors Python _reset_tunnel_runtime_state)
+        state.count_ping.store(0, Ordering::Relaxed);
+        state.enqueue_seq.store(0, Ordering::Relaxed);
+        state.round_robin_stream_id.store(0, Ordering::Relaxed);
+        state.last_stream_id.store(0, Ordering::Relaxed);
+        state.session_cookie.store(0, Ordering::SeqCst);
+        {
+            let mut mq = state.main_queue.lock().await;
+            mq.clear();
+        }
+        {
+            let mut ids = state.active_response_ids.lock().await;
+            ids.clear();
+        }
+        {
+            let mut rset = state.active_response_set.lock().await;
+            rset.clear();
+        }
+        {
+            let mut streams = state.active_streams.lock().await;
+            streams.clear();
+        }
+        {
+            let mut closed = state.closed_streams.lock().await;
+            closed.clear();
+        }
+        {
+            let mut sc = state.server_send_counts.lock().await;
+            sc.clear();
+        }
+
         tracing::info!("Setting up connections...");
 
         if !state.success_mtu_checks.load(Ordering::Relaxed) {
@@ -100,6 +132,9 @@ pub async fn run() {
                 let conn_map = state.connection_map.lock().await;
                 conn_map.len()
             };
+
+            // Config recommendations (mirrors Python: called at start of test_mtu_sizes)
+            recommendations::config_recommendations(&state).await;
 
             // MTU testing for all connections
             match mtu::test_mtu_sizes(&state).await {
@@ -195,6 +230,9 @@ pub async fn run() {
                 break;
             }
         }
+
+        // Apply session compression policy (mirrors Python _apply_session_compression_policy)
+        recommendations::apply_session_compression_policy(&state);
 
         // Session init (mirrors Python _init_session)
         let max_attempts = cfg.get_i64_or("MAX_CONNECTION_ATTEMPTS", 10) as u32;
@@ -404,8 +442,8 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
         recheck_batch_size: AtomicUsize::new(5),
         recheck_inactive_interval_seconds: std::sync::atomic::AtomicU64::new(30),
         recheck_server_interval_seconds: std::sync::atomic::AtomicU64::new(60),
-        config_version: 0,
-        min_config_version: 0,
+        config_version: cfg.get_i64_or("CONFIG_VERSION", 0) as u32,
+        min_config_version: 3,
         resolver_balancing_strategy,
     })
 }
