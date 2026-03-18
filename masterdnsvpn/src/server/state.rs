@@ -3,7 +3,7 @@
 // Github: https://github.com/masterking32
 // Year: 2026
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,6 +88,8 @@ pub struct SessionState {
     pub session_cookie: u8,
     pub client_addr: SocketAddr,
     pub last_activity: Instant,
+    pub created_at: Instant,
+    pub init_token: Vec<u8>,
     pub streams: HashMap<u16, ServerStreamData>,
     pub closed_streams: HashMap<u16, Instant>,
     pub main_queue: BinaryHeap<QueueItem>,
@@ -106,11 +108,14 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(session_id: u8, session_cookie: u8, client_addr: SocketAddr) -> Self {
+        let now = Instant::now();
         Self {
             session_id,
             session_cookie,
             client_addr,
-            last_activity: Instant::now(),
+            last_activity: now,
+            created_at: now,
+            init_token: Vec::new(),
             streams: HashMap::new(),
             closed_streams: HashMap::new(),
             main_queue: BinaryHeap::new(),
@@ -136,6 +141,7 @@ pub struct ServerState {
     // Sessions
     pub sessions: Mutex<HashMap<u8, SessionState>>,
     pub recently_closed_sessions: Mutex<HashMap<u8, ClosedSessionInfo>>,
+    pub free_session_ids: Mutex<VecDeque<u8>>,
     pub max_sessions: usize,
 
     // Core components
@@ -165,6 +171,7 @@ pub struct ServerState {
     pub supported_download_compression_types: Vec<u8>,
     pub arq_config: ArqConfig,
     pub session_timeout_secs: f64,
+    pub session_cleanup_interval: f64,
     pub stream_idle_timeout_secs: f64,
     pub socks_handshake_timeout: f64,
     pub socks_connect_semaphore: Arc<Semaphore>,
@@ -184,6 +191,12 @@ pub struct ServerState {
     pub socks5_error_types: HashSet<u8>,
     pub terminal_fallback_types: HashSet<u8>,
 
+    // Config diagnostics
+    pub encrypt_key: String,
+    pub encryption_method: u8,
+    pub config_version: f64,
+    pub min_config_version: f64,
+
     // Background task tracking
     pub background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -191,6 +204,7 @@ pub struct ServerState {
 #[derive(Clone)]
 pub struct ClosedSessionInfo {
     pub base_encode: bool,
+    pub session_cookie: u8,
     pub closed_at: Instant,
 }
 

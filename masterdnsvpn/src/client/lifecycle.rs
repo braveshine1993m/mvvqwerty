@@ -141,7 +141,12 @@ pub async fn run() {
                 Some(_r) => {},
                 None => {
                     tracing::error!("No valid servers found to connect.");
-                    break;
+                    if !state.running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tracing::warn!("Restarting Client workflow in 2 seconds...");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
                 }
             };
 
@@ -150,14 +155,24 @@ pub async fn run() {
                 let conn_map = state.connection_map.lock().await;
                 let valid: Vec<_> = conn_map.iter().filter(|c| c.is_valid).cloned().collect();
                 if valid.is_empty() {
-                    tracing::error!("No valid connections found after MTU testing!");
-                    break;
-                }
+                    (vec![], 0usize, 0usize, 0usize)
+                } else {
                 let min_up = valid.iter().map(|c| c.upload_mtu_bytes).min().unwrap_or(0);
                 let min_up_chars = valid.iter().map(|c| c.upload_mtu_chars).min().unwrap_or(0);
                 let min_down = valid.iter().map(|c| c.download_mtu_bytes).min().unwrap_or(0);
                 (valid, min_up, min_up_chars, min_down)
+                }
             };
+
+            if valid_conns.is_empty() {
+                tracing::error!("No valid connections found after MTU testing!");
+                if !state.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                tracing::warn!("Restarting Client workflow in 2 seconds...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
 
             // Update balancer with valid connections
             {
@@ -227,7 +242,13 @@ pub async fn run() {
             let mut bal = state.balancer.lock().await;
             if bal.get_best_server().is_none() {
                 tracing::error!("No active servers available from Balancer.");
-                break;
+                drop(bal);
+                if !state.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                tracing::warn!("Restarting Client workflow in 2 seconds...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
             }
         }
 

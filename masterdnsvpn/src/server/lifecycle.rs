@@ -3,7 +3,7 @@
 // Github: https://github.com/masterking32
 // Year: 2026
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -229,6 +229,7 @@ fn build_server_state(cfg: &HashMap<String, toml::Value>) -> Arc<ServerState> {
 
     let max_sessions = cfg.get_i64_or("MAX_SESSIONS", 255) as usize;
     let session_timeout = cfg.get_f64_or("SESSION_TIMEOUT", 300.0);
+    let session_cleanup_interval = cfg.get_f64_or("SESSION_CLEANUP_INTERVAL", 10.0);
     let stream_idle_timeout = cfg.get_f64_or("STREAM_IDLE_TIMEOUT", 120.0);
     let socks_handshake_timeout = cfg.get_f64_or("SOCKS_HANDSHAKE_TIMEOUT", 180.0);
 
@@ -244,13 +245,28 @@ fn build_server_state(cfg: &HashMap<String, toml::Value>) -> Arc<ServerState> {
     let max_packets_per_batch = cfg.get_i64_or("MAX_PACKETS_PER_BATCH", 1000) as usize;
     let socks_concurrency = cfg.get_i64_or("MAX_CONCURRENT_SOCKS_CONNECTS", 16) as usize;
 
+    let config_version = cfg.get_f64_or("CONFIG_VERSION", 0.1);
+    let min_config_version: f64 = 2.0;
+
     let log_level = cfg.get_str_or("LOG_LEVEL", "INFO");
     utils::init_logger(&log_level, None, 0, 0, false);
 
-    tracing::info!("Protocol: {}", protocol_type);
-    tracing::info!("Domains: {:?}", allowed_domains);
-    tracing::info!("Encryption: method={}", encryption_method);
-    tracing::info!("Listen: {}:{}", listen_ip, listen_port);
+    // Startup banner (mirrors Python __init__ diagnostics)
+    tracing::warn!("{}", "=".repeat(60));
+    tracing::warn!("MasterDnsVPN Server Starting with Configuration:");
+    tracing::warn!("{}", "-".repeat(60));
+    tracing::warn!("Using encryption key: {}", encryption_key);
+    tracing::warn!("Encryption method: {}", encryption_method);
+    tracing::warn!("Allowed domains: {}", allowed_domains.join(", "));
+    tracing::warn!("{}", "=".repeat(60));
+
+    if config_version < min_config_version {
+        tracing::warn!(
+            "Your config version ({}) is outdated. Please update your config file to the latest version ({}) for best performance and new features.",
+            config_version,
+            min_config_version
+        );
+    }
 
     let parser = Arc::new(DnsPacketParser::new(&encryption_key, encryption_method));
     let crypto_overhead = parser.get_max_vpn_header_raw_size() + 32;
@@ -267,9 +283,13 @@ fn build_server_state(cfg: &HashMap<String, toml::Value>) -> Arc<ServerState> {
         ..ArqConfig::default()
     };
 
+    // Build free session ID pool (mirrors Python deque(range(1, max_sessions+1)))
+    let free_ids: VecDeque<u8> = (1..=max_sessions.min(255) as u8).collect();
+
     Arc::new(ServerState {
         sessions: Mutex::new(HashMap::new()),
         recently_closed_sessions: Mutex::new(HashMap::new()),
+        free_session_ids: Mutex::new(free_ids),
         max_sessions,
         parser,
         queue_manager: Mutex::new(PacketQueueManager::new()),
@@ -291,6 +311,7 @@ fn build_server_state(cfg: &HashMap<String, toml::Value>) -> Arc<ServerState> {
         supported_download_compression_types: supported_download_comp,
         arq_config,
         session_timeout_secs: session_timeout,
+        session_cleanup_interval,
         stream_idle_timeout_secs: stream_idle_timeout,
         socks_handshake_timeout,
         socks_connect_semaphore: Arc::new(Semaphore::new(socks_concurrency)),
@@ -307,6 +328,10 @@ fn build_server_state(cfg: &HashMap<String, toml::Value>) -> Arc<ServerState> {
         packable_control_types: config::packable_control_types(),
         socks5_error_types: config::socks5_error_packet_types(),
         terminal_fallback_types: config::terminal_fallback_packet_types(),
+        encrypt_key: encryption_key.to_string(),
+        encryption_method,
+        config_version,
+        min_config_version,
         background_tasks: Mutex::new(Vec::new()),
     })
 }

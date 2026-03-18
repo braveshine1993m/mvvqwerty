@@ -47,6 +47,33 @@ pub async fn handle_vpn_packet(
         .await;
     }
 
+    // Check session exists (mirrors Python: session = self.sessions.get(session_id))
+    {
+        let sessions = state.sessions.lock().await;
+        if !sessions.contains_key(&session_id) {
+            tracing::debug!(
+                "Packet received for expired/invalid session {} from {}. Dropping.",
+                session_id, addr
+            );
+            drop(sessions);
+            return build_invalid_session_error(state, session_id, request_domain, data);
+        }
+    }
+
+    // Handle SET_MTU_REQ (returns direct response, mirrors Python)
+    if packet_type == PacketType::SET_MTU_REQ {
+        return mtu::handle_set_mtu(
+            state,
+            session_id,
+            data,
+            labels,
+            request_domain,
+            data,
+            extracted_header,
+        )
+        .await;
+    }
+
     // Touch session activity
     session::touch_session(state, session_id).await;
 
@@ -56,6 +83,38 @@ pub async fn handle_vpn_packet(
 
     // Build response with piggybacked data from the session's queues
     build_piggybacked_response(state, session_id, request_domain, data, extracted_header).await
+}
+
+/// Build ERROR_DROP response for invalid/expired sessions (mirrors Python)
+fn build_invalid_session_error(
+    state: &ServerState,
+    session_id: u8,
+    request_domain: &str,
+    question_packet: &[u8],
+) -> Option<Vec<u8>> {
+    let base_encode = {
+        let closed = state.recently_closed_sessions.try_lock();
+        match closed {
+            Ok(c) => c.get(&session_id).map(|i| i.base_encode),
+            Err(_) => None,
+        }
+    }
+    .unwrap_or(rand::random::<bool>());
+
+    let mut inv_data = vec![b'I', b'N', b'V'];
+    for _ in 0..5 {
+        inv_data.push(rand::random::<u8>());
+    }
+
+    Some(state.parser.generate_simple_vpn_response(
+        request_domain,
+        session_id,
+        PacketType::ERROR_DROP,
+        &inv_data,
+        question_packet,
+        base_encode,
+        0,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -69,28 +128,19 @@ async fn handle_pre_session_packet(
     data: &[u8],
     labels: &str,
     request_domain: &str,
-    addr: std::net::SocketAddr,
+    _addr: std::net::SocketAddr,
     extracted_header: &VpnHeaderData,
 ) -> Option<Vec<u8>> {
     match packet_type {
         PacketType::SESSION_INIT => {
-            // Extract payload from labels
-            let payload = state.parser.extract_vpn_data_from_labels(labels);
-
-            let result = session::handle_session_init(state, session_id, addr, &payload).await?;
-            let (sid, cookie, _is_new) = result;
-
-            // Build SESSION_ACCEPT response
-            let response_data = vec![cookie];
-            Some(state.parser.generate_simple_vpn_response(
+            session::handle_session_init(
+                state,
+                labels,
                 request_domain,
-                sid,
-                PacketType::SESSION_ACCEPT,
-                &response_data,
                 data,
-                false,
-                0,
-            ))
+                extracted_header,
+            )
+            .await
         }
         PacketType::MTU_UP_REQ => {
             mtu::handle_mtu_up(state, session_id, labels, request_domain, data).await
@@ -647,6 +697,32 @@ async fn handle_closed_stream_packet(
             )
             .await;
         }
+        PacketType::STREAM_DATA_ACK => {
+            // Client ACKing data on a closed stream — send RST
+            queue::enqueue_packet(
+                state,
+                session_id,
+                0,
+                stream_id,
+                0,
+                PacketType::STREAM_RST,
+                vec![],
+            )
+            .await;
+        }
+        PacketType::SOCKS5_SYN => {
+            // SOCKS5 SYN on a closed stream — send SOCKS5_CONNECT_FAIL
+            queue::enqueue_packet(
+                state,
+                session_id,
+                0,
+                stream_id,
+                0,
+                PacketType::SOCKS5_CONNECT_FAIL,
+                vec![],
+            )
+            .await;
+        }
         _ => {}
     }
 }
@@ -668,18 +744,30 @@ async fn build_piggybacked_response(
         None => return None,
     };
 
-    let item = match queue::dequeue_response_packet(state, session) {
-        Some(i) => i,
-        None => return None,
-    };
+    // Dequeue or default to PONG
+    let (ptype, stream_id, sn, mut data) =
+        match queue::dequeue_response_packet(state, session) {
+            Some(item) => {
+                let final_item = queue::maybe_pack_control_blocks(state, session, item);
+                (
+                    final_item.packet_type,
+                    final_item.stream_id,
+                    final_item.sequence_num,
+                    final_item.data,
+                )
+            }
+            None => (PacketType::PONG, 0u16, 0u16, vec![]),
+        };
 
-    // Pack control blocks if applicable
-    let final_item = queue::maybe_pack_control_blocks(state, session, item);
+    // Python: if res_ptype == Packet_Type.PONG: res_data = b"PO:" + os.urandom(4)
+    if ptype == PacketType::PONG {
+        let mut pong_data = vec![b'P', b'O', b':'];
+        for _ in 0..4 {
+            pong_data.push(rand::random::<u8>());
+        }
+        data = pong_data;
+    }
 
-    let ptype = final_item.packet_type;
-    let stream_id = final_item.stream_id;
-    let sn = final_item.sequence_num;
-    let mut data = final_item.data;
     let base_encode = session.base_encode_responses;
     let cookie = session.session_cookie;
     let download_comp = session.download_compression;
@@ -687,9 +775,13 @@ async fn build_piggybacked_response(
 
     drop(sessions);
 
-    // Compress response data
+    // Compress response data if applicable
     let mut actual_comp: u8 = CompressionType::OFF;
-    if !data.is_empty() && download_comp != CompressionType::OFF {
+    if !data.is_empty()
+        && download_comp != CompressionType::OFF
+        && ptype != PacketType::PONG
+    {
+        // Python only compresses types in _PT_COMP_EXT (data-bearing types)
         let (compressed, ct) = compress_payload(&data, download_comp, comp_min);
         data = compressed;
         actual_comp = ct;

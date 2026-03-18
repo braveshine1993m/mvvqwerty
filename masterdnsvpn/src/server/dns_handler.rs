@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::dns_utils::dns_enums::PacketType;
+use crate::dns_utils::dns_enums::{DnsRecordType, PacketType};
 use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 
 use super::packet_handler;
@@ -42,8 +42,20 @@ pub async fn handle_single_request(
         }
     };
     if !is_allowed_domain(state, &qname) {
-        send_servfail(state, raw_data, addr).await;
+        tracing::debug!(
+            "Received DNS request for unauthorized domain '{}' from {}. Ignoring.",
+            qname, addr
+        );
+        send_refused(state, raw_data, addr).await;
         return;
+    }
+
+    // Validate qType is TXT (mirrors Python q0.get("qType") != DNS_Record_Type.TXT)
+    if let Some(q) = dns_packet.questions.first() {
+        if q.qtype != DnsRecordType::TXT {
+            send_empty_noerror(state, raw_data, addr).await;
+            return;
+        }
     }
 
     // Extract the request domain (the allowed domain suffix)
@@ -87,69 +99,35 @@ pub async fn handle_single_request(
         return;
     }
 
-    // Validate session cookie for post-session packets
-    if !state.pre_session_packet_types.contains(&packet_type) {
-        let expected = session::expected_session_cookie(state, packet_type, session_id).await;
-        match expected {
-            Some(expected_cookie) => {
-                if expected_cookie != 0 && hdr.session_cookie != expected_cookie {
-                    tracing::debug!(
-                        "Cookie mismatch for session {}: expected={}, got={}",
-                        session_id,
-                        expected_cookie,
-                        hdr.session_cookie
-                    );
-                    // Send ERROR_DROP
-                    let response =
-                        build_invalid_session_error_response(state, session_id, &request_domain, raw_data);
-                    if let Some(resp) = response {
-                        send_response(state, &resp, addr).await;
-                    }
-                    return;
-                }
-            }
-            None => {
-                // Session doesn't exist — send ERROR_DROP
-                if session::should_emit_invalid_cookie_error(
-                    packet_type,
-                    None,
-                    hdr.session_cookie,
-                ) {
-                    let response = build_invalid_session_error_response(
-                        state,
-                        session_id,
-                        &request_domain,
-                        raw_data,
-                    );
-                    if let Some(resp) = response {
-                        send_response(state, &resp, addr).await;
-                    }
-                }
-                return;
-            }
-        }
-    }
+    // Validate session cookie for all packet types (mirrors Python)
+    let expected_cookie = session::expected_session_cookie(state, packet_type, session_id).await;
+    let packet_cookie = hdr.session_cookie;
 
-    // Handle SET_MTU_REQ directly (returns a response)
-    if packet_type == PacketType::SET_MTU_REQ {
-        let response = super::mtu::handle_set_mtu(
-            state,
-            session_id,
-            raw_data,
-            &labels,
-            &request_domain,
-            raw_data,
-            &hdr,
-        )
-        .await;
-        if let Some(resp) = response {
-            send_response(state, &resp, addr).await;
+    if expected_cookie.is_none() || packet_cookie != expected_cookie.unwrap_or(0) {
+        tracing::debug!(
+            "Invalid session cookie for packet type '{}' session '{}' from {}. Dropping.",
+            packet_type, session_id, addr
+        );
+        if session::should_emit_invalid_cookie_error(
+            packet_type,
+            expected_cookie,
+            packet_cookie,
+        ) {
+            let response = build_invalid_session_error_response(
+                state,
+                session_id,
+                &request_domain,
+                raw_data,
+            );
+            if let Some(resp) = response {
+                send_response(state, &resp, addr).await;
+            }
         }
         return;
     }
 
     // Dispatch to main packet handler
-    let response = packet_handler::handle_vpn_packet(
+    let vpn_response = packet_handler::handle_vpn_packet(
         state,
         packet_type,
         session_id,
@@ -161,29 +139,13 @@ pub async fn handle_single_request(
     )
     .await;
 
-    if let Some(resp) = response {
+    if let Some(resp) = vpn_response {
         send_response(state, &resp, addr).await;
-    } else {
-        // No piggybacked data available — send empty DNS response
-        // (The server always responds to DNS queries)
-        let cookie = {
-            let sessions = state.sessions.lock().await;
-            sessions
-                .get(&session_id)
-                .map(|s| s.session_cookie)
-                .unwrap_or(0)
-        };
-        let empty_response = state.parser.generate_simple_vpn_response(
-            &request_domain,
-            session_id,
-            PacketType::PONG,
-            &[],
-            raw_data,
-            false,
-            cookie,
-        );
-        send_response(state, &empty_response, addr).await;
+        return;
     }
+
+    // Fallback: send empty NOERROR DNS response (mirrors Python)
+    send_empty_noerror(state, raw_data, addr).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,26 +208,56 @@ async fn send_servfail(state: &ServerState, request: &[u8], addr: SocketAddr) {
     send_response(state, &response, addr).await;
 }
 
+async fn send_refused(state: &ServerState, request: &[u8], addr: SocketAddr) {
+    let response = DnsPacketParser::refused_response(request);
+    send_response(state, &response, addr).await;
+}
+
+async fn send_empty_noerror(state: &ServerState, request: &[u8], addr: SocketAddr) {
+    let response = DnsPacketParser::empty_noerror_response(request);
+    send_response(state, &response, addr).await;
+}
+
 fn build_invalid_session_error_response(
     state: &ServerState,
     session_id: u8,
     request_domain: &str,
     question_packet: &[u8],
 ) -> Option<Vec<u8>> {
-    // Check recently_closed for base_encode preference
+    // Check recently_closed for base_encode preference, else random
     let base_encode = {
+        // Check active sessions first
+        let sess = state.sessions.try_lock();
+        if let Ok(sessions) = sess {
+            if let Some(s) = sessions.get(&session_id) {
+                Some(s.base_encode_responses)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    .or_else(|| {
         let closed = state.recently_closed_sessions.try_lock();
         match closed {
-            Ok(c) => c.get(&session_id).map(|i| i.base_encode).unwrap_or(false),
-            Err(_) => false,
+            Ok(c) => c.get(&session_id).map(|i| i.base_encode),
+            Err(_) => None,
         }
-    };
+    })
+    .unwrap_or(rand::random::<bool>());
+
+    // Python: invalid_response_data = b"INV" + os.urandom(5)
+    let mut inv_data = vec![b'I', b'N', b'V'];
+    for _ in 0..5 {
+        inv_data.push(rand::random::<u8>());
+    }
 
     Some(state.parser.generate_simple_vpn_response(
         request_domain,
         session_id,
         PacketType::ERROR_DROP,
-        &[],
+        &inv_data,
         question_packet,
         base_encode,
         0,

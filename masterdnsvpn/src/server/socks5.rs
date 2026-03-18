@@ -120,7 +120,8 @@ pub fn parse_socks5_target(payload: &[u8]) -> Option<Socks5Target> {
 // Process SOCKS5 target connection (mirrors Python _process_socks5_target)
 // ---------------------------------------------------------------------------
 
-/// Connect to the target host, set up ARQ, and send SOCKS5_SYN_ACK.
+/// Connect to the target host (directly or via external SOCKS5), set up ARQ,
+/// and send SOCKS5_SYN_ACK.
 pub async fn process_socks5_target(
     state: &Arc<ServerState>,
     session_id: u8,
@@ -157,171 +158,335 @@ pub async fn process_socks5_target(
         }
     };
 
-    tracing::debug!(
-        "SOCKS5 connecting to {} for stream {} session {}",
-        target.addr_display,
-        stream_id,
-        session_id
-    );
+    let mut acquired_connect_slot = false;
 
-    // Acquire connect semaphore slot
-    let acquired = state.socks_connect_semaphore.try_acquire();
-    if acquired.is_err() {
-        tracing::debug!("SOCKS5 connect semaphore full, rejecting stream {}", stream_id);
+    let result: Result<(), (u8, String)> = async {
+        // Acquire connect semaphore slot with retry loop (mirrors Python)
+        loop {
+            if state.is_stopping() {
+                return Err((PacketType::SOCKS5_UPSTREAM_UNAVAILABLE, "Server stopping".into()));
+            }
+            // Check stream status
+            {
+                let sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if let Some(sd) = session.streams.get(&stream_id) {
+                        if sd.status == "CLOSING" || sd.status == "TIME_WAIT" {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.socks_connect_semaphore.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => {
+                    acquired_connect_slot = true;
+                    // Update last_activity
+                    {
+                        let mut sessions = state.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            if let Some(sd) = session.streams.get_mut(&stream_id) {
+                                sd.last_activity = std::time::Instant::now();
+                            }
+                        }
+                    }
+                    // We need to forget the permit since we track it manually
+                    permit.forget();
+                    break;
+                }
+                Ok(Err(_)) => {
+                    return Err((PacketType::SOCKS5_UPSTREAM_UNAVAILABLE, "Semaphore closed".into()));
+                }
+                Err(_) => {
+                    // Timeout - update last_activity and retry
+                    let mut sessions = state.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        if let Some(sd) = session.streams.get_mut(&stream_id) {
+                            sd.last_activity = std::time::Instant::now();
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if !acquired_connect_slot {
+            return Ok(());
+        }
+
+        // Connect and handshake
+        let connect_result = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            connect_and_handshake(state, &target, stream_id, &payload),
+        )
+        .await;
+
+        // Always release semaphore after connect attempt
+        state.socks_connect_semaphore.add_permits(1);
+        acquired_connect_slot = false;
+
+        let tcp_stream = match connect_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return Err((map_socks5_err_string(&e), format!("SOCKS target unreachable: {}", e)));
+            }
+            Err(_) => {
+                return Err((PacketType::SOCKS5_TTL_EXPIRED, "Connection timeout".into()));
+            }
+        };
+
+        // Check stream wasn't closed during connection
+        {
+            let sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                if let Some(sd) = session.streams.get(&stream_id) {
+                    if sd.status == "CLOSING" || sd.status == "TIME_WAIT" {
+                        drop(sessions);
+                        drop(tcp_stream);
+                        tracing::debug!(
+                            "Stream {} was closed during connection phase. Aborting.",
+                            stream_id
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let (reader, writer) = tcp_stream.into_split();
+
+        let mtu = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&session_id)
+                .map(|s| s.download_mtu)
+                .unwrap_or(50)
+        };
+
+        let arq = stream::create_server_arq_stream(
+            state,
+            session_id,
+            stream_id,
+            reader,
+            writer,
+            mtu,
+            vec![],
+        );
+
+        // Store ARQ, update status, cache SYN_ACK
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                if let Some(sd) = session.streams.get_mut(&stream_id) {
+                    sd.arq = Some(arq);
+                    sd.status = "CONNECTED".to_string();
+                    sd.target_addr = target.addr_display.clone();
+                    sd.syn_responses.insert(
+                        "socks".to_string(),
+                        CachedResponse {
+                            packet_type: PacketType::SOCKS5_SYN_ACK,
+                            payload: vec![],
+                            priority: 2,
+                            sequence_num: 0,
+                        },
+                    );
+                }
+            }
+        }
+
+        queue::enqueue_packet(
+            state,
+            session_id,
+            2,
+            stream_id,
+            0,
+            PacketType::SOCKS5_SYN_ACK,
+            vec![],
+        )
+        .await;
+
+        // Also cache fragment response if multi-fragment
+        if let Some(frag_id) = response_fragment_id {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                if let Some(sd) = session.streams.get_mut(&stream_id) {
+                    sd.syn_responses.insert(
+                        format!("socks_frag_{}", frag_id),
+                        CachedResponse {
+                            packet_type: PacketType::SOCKS5_SYN_ACK,
+                            payload: vec![],
+                            priority: 2,
+                            sequence_num: 0,
+                        },
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            "SOCKS5 connected to {} for stream {} session {}",
+            target.addr_display,
+            stream_id,
+            session_id
+        );
+
+        Ok(())
+    }
+    .await;
+
+    if let Err((err_ptype, reason)) = result {
         send_socks5_error_packet(
             state,
             session_id,
             stream_id,
-            PacketType::SOCKS5_UPSTREAM_UNAVAILABLE,
+            err_ptype,
             response_fragment_id,
         )
         .await;
+        tracing::debug!(
+            "SOCKS5 connection failed for stream {} session {}: {}",
+            stream_id,
+            session_id,
+            reason
+        );
         stream::close_stream(
             state,
             session_id,
             stream_id,
-            "Connect semaphore full",
+            &reason,
             true,
             false,
         )
         .await;
-        return;
     }
-    let _permit = acquired.unwrap();
 
-    // Connect to the target
-    let connect_timeout = std::time::Duration::from_secs_f64(state.socks_handshake_timeout);
-    let tcp_result = tokio::time::timeout(
-        connect_timeout,
-        TcpStream::connect(format!("{}:{}", target.host, target.port)),
-    )
-    .await;
+    if acquired_connect_slot {
+        state.socks_connect_semaphore.add_permits(1);
+    }
+}
 
-    match tcp_result {
-        Ok(Ok(tcp_stream)) => {
-            let (reader, writer) = tcp_stream.into_split();
+/// Connect directly or via external SOCKS5 proxy (mirrors Python _connect_and_handshake)
+async fn connect_and_handshake(
+    state: &Arc<ServerState>,
+    target: &Socks5Target,
+    stream_id: u16,
+    raw_payload: &[u8],
+) -> Result<TcpStream, String> {
+    if state.use_external_socks5 {
+        tracing::debug!(
+            "Forwarding to External SOCKS5 {}:{} for target {} (Stream {})",
+            state.forward_ip,
+            state.forward_port,
+            target.addr_display,
+            stream_id
+        );
 
-            // Get download MTU from session
-            let mtu = {
-                let sessions = state.sessions.lock().await;
-                sessions
-                    .get(&session_id)
-                    .map(|s| s.download_mtu)
-                    .unwrap_or(50)
-            };
+        let stream = TcpStream::connect(format!("{}:{}", state.forward_ip, state.forward_port))
+            .await
+            .map_err(|e| format!("Failed to connect to external SOCKS5: {}", e))?;
 
-            let arq = stream::create_server_arq_stream(
-                state,
-                session_id,
-                stream_id,
-                reader,
-                writer,
-                mtu,
-                vec![], // no initial data for server side
-            );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut reader, mut writer) = stream.into_split();
 
-            // ARQ rcv_nxt starts at 0 for first STREAM_DATA
-            // (SOCKS5_SYN is handled on control-plane)
+        // SOCKS5 greeting
+        if state.socks5_auth {
+            writer.write_all(&[0x05, 0x01, 0x02]).await.map_err(|e| e.to_string())?;
+        } else {
+            writer.write_all(&[0x05, 0x01, 0x00]).await.map_err(|e| e.to_string())?;
+        }
 
-            // Store ARQ and update stream status
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    if let Some(sd) = session.streams.get_mut(&stream_id) {
-                        sd.arq = Some(arq);
-                        sd.status = "CONNECTED".to_string();
-                        sd.target_addr = target.addr_display.clone();
-                    }
-                }
+        let mut greeting_res = [0u8; 2];
+        reader.read_exact(&mut greeting_res).await.map_err(|e| e.to_string())?;
+
+        if greeting_res[0] != 0x05 {
+            return Err("Upstream proxy is not a valid SOCKS5 server".into());
+        }
+
+        if state.socks5_auth && greeting_res[1] == 0x02 {
+            let u_bytes = state.socks5_user.as_bytes();
+            let p_bytes = state.socks5_pass.as_bytes();
+            let mut auth_req = vec![0x01, u_bytes.len() as u8];
+            auth_req.extend_from_slice(u_bytes);
+            auth_req.push(p_bytes.len() as u8);
+            auth_req.extend_from_slice(p_bytes);
+            writer.write_all(&auth_req).await.map_err(|e| e.to_string())?;
+
+            let mut auth_res = [0u8; 2];
+            reader.read_exact(&mut auth_res).await.map_err(|e| e.to_string())?;
+            if auth_res[1] != 0x00 {
+                return Err("External SOCKS5 Authentication failed!".into());
             }
+        } else if greeting_res[1] != 0x00 {
+            return Err("External SOCKS5 requires unsupported authentication method".into());
+        }
 
-            // Send SOCKS5_SYN_ACK
-            queue::enqueue_packet(
-                state,
-                session_id,
-                2,
-                stream_id,
-                0,
-                PacketType::SOCKS5_SYN_ACK,
-                vec![],
-            )
-            .await;
+        // SOCKS5 connect request
+        let mut conn_req = vec![0x05, 0x01, 0x00];
+        conn_req.extend_from_slice(raw_payload);
+        writer.write_all(&conn_req).await.map_err(|e| e.to_string())?;
 
-            // Cache the SYN_ACK response for retransmission
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    if let Some(sd) = session.streams.get_mut(&stream_id) {
-                        sd.syn_responses.insert(
-                            "socks".to_string(),
-                            CachedResponse {
-                                packet_type: PacketType::SOCKS5_SYN_ACK,
-                                payload: vec![],
-                                priority: 2,
-                                sequence_num: 0,
-                            },
-                        );
-                    }
-                }
+        let mut resp_header = [0u8; 4];
+        reader.read_exact(&mut resp_header).await.map_err(|e| e.to_string())?;
+
+        if resp_header[0] != 0x05 || resp_header[1] != 0x00 {
+            return Err(format!(
+                "External SOCKS5 failed to connect to target. Code: {}",
+                resp_header[1]
+            ));
+        }
+
+        // Skip bound address
+        let bnd_atyp = resp_header[3];
+        match bnd_atyp {
+            0x01 => {
+                let mut skip = [0u8; 6];
+                reader.read_exact(&mut skip).await.map_err(|e| e.to_string())?;
             }
+            0x03 => {
+                let mut dlen = [0u8; 1];
+                reader.read_exact(&mut dlen).await.map_err(|e| e.to_string())?;
+                let mut skip = vec![0u8; dlen[0] as usize + 2];
+                reader.read_exact(&mut skip).await.map_err(|e| e.to_string())?;
+            }
+            0x04 => {
+                let mut skip = [0u8; 18];
+                reader.read_exact(&mut skip).await.map_err(|e| e.to_string())?;
+            }
+            _ => {}
+        }
 
-            tracing::debug!(
-                "SOCKS5 connected to {} for stream {} session {}",
-                target.addr_display,
-                stream_id,
-                session_id
-            );
-        }
-        Ok(Err(e)) => {
-            let err_ptype = map_socks5_exception_to_packet(&e);
-            send_socks5_error_packet(
-                state,
-                session_id,
-                stream_id,
-                err_ptype,
-                response_fragment_id,
-            )
-            .await;
-            tracing::debug!(
-                "SOCKS5 connection failed for stream {} session {}: {}",
-                stream_id,
-                session_id,
-                e
-            );
-            stream::close_stream(
-                state,
-                session_id,
-                stream_id,
-                &format!("SOCKS target unreachable: {}", e),
-                true,
-                false,
-            )
-            .await;
-        }
-        Err(_) => {
-            send_socks5_error_packet(
-                state,
-                session_id,
-                stream_id,
-                PacketType::SOCKS5_TTL_EXPIRED,
-                response_fragment_id,
-            )
-            .await;
-            tracing::debug!(
-                "SOCKS5 connection timed out for stream {} session {}",
-                stream_id,
-                session_id
-            );
-            stream::close_stream(
-                state,
-                session_id,
-                stream_id,
-                "SOCKS connect timeout",
-                true,
-                false,
-            )
-            .await;
-        }
+        Ok(reader.reunite(writer).expect("reunite should work"))
+    } else {
+        tracing::debug!(
+            "SOCKS5 Fast-Connecting directly to {} for stream {}",
+            target.addr_display,
+            stream_id
+        );
+        TcpStream::connect(format!("{}:{}", target.host, target.port))
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Map a string error to SOCKS5 error packet type
+fn map_socks5_err_string(err: &str) -> u8 {
+    let lower = err.to_lowercase();
+    if lower.contains("connection refused") {
+        PacketType::SOCKS5_CONNECTION_REFUSED
+    } else if lower.contains("network unreachable") || lower.contains("network is unreachable") {
+        PacketType::SOCKS5_NETWORK_UNREACHABLE
+    } else if lower.contains("host unreachable") || lower.contains("no route to host") {
+        PacketType::SOCKS5_HOST_UNREACHABLE
+    } else if lower.contains("timed out") || lower.contains("deadline") {
+        PacketType::SOCKS5_TTL_EXPIRED
+    } else if lower.contains("authentication failed") {
+        PacketType::SOCKS5_AUTH_FAILED
+    } else {
+        PacketType::SOCKS5_CONNECT_FAIL
     }
 }
 
@@ -423,7 +588,18 @@ pub async fn handle_socks5_syn(
 
         // Check if we have all fragments
         if sd.socks_chunks.len() < total_frags as usize {
+            // Send fragment ACK for this intermediate fragment (mirrors Python)
             drop(sessions);
+            queue::enqueue_packet(
+                state,
+                session_id,
+                2,
+                stream_id,
+                0,
+                PacketType::SOCKS5_SYN_ACK,
+                vec![],
+            )
+            .await;
             return;
         }
 
