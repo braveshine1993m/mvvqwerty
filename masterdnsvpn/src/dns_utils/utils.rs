@@ -150,7 +150,7 @@ pub fn init_logger(
 }
 
 /// Set UDP socket buffer sizes.
-pub fn set_socket_buffer_size(sock: &UdpSocket, size: usize) {
+pub fn set_socket_buffer_size(sock: &TokioUdpSocket, size: usize) {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

@@ -71,7 +71,7 @@ pub async fn handle_single_request(
         }
     };
     // Extract encrypted payload data from the labels
-    let label_payload = state.parser.extract_vpn_data_from_labels(&labels);
+    let _label_payload = state.parser.extract_vpn_data_from_labels(&labels);
 
     let packet_type = hdr.packet_type;
     let session_id = hdr.session_id;

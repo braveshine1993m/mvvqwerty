@@ -152,7 +152,7 @@ pub async fn enqueue_packet(
 /// Returns None if no packets are available.
 /// Caller must hold the sessions lock.
 pub fn dequeue_response_packet(
-    state: &ServerState,
+    _state: &ServerState,
     session: &mut SessionState,
 ) -> Option<QueueItem> {
     if session.active_response_ids.is_empty() {

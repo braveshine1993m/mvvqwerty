@@ -77,7 +77,7 @@ pub async fn inactive_server_recheck_worker(
         let to_reactivate: Vec<String> = disabled
             .iter()
             .filter(|(_, disabled_at)| {
-                now.duration_since(disabled_at).as_secs_f64() > recheck_interval_secs
+                now.duration_since(**disabled_at).as_secs_f64() > recheck_interval_secs
             })
             .map(|(k, _)| k.clone())
             .collect();

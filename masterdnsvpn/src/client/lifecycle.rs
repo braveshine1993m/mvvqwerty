@@ -421,7 +421,7 @@ async fn handle_client_connection(
         }
     }
 
-    let now = Instant::now();
+    let _now = Instant::now();
     let handshake_event = Arc::new(Notify::new());
 
     // Create the stream data

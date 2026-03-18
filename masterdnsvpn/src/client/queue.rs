@@ -81,7 +81,7 @@ pub async fn enqueue_packet(
 
     if stream_id == 0 {
         // Main queue (session-level packets)
-        let mut qm = state.queue_manager.lock().await;
+        let qm = state.queue_manager.lock().await;
         let mut owner = state.main_queue_owner.lock().await;
         if !qm.track_main_packet_once(&mut owner, stream_id, ptype, sn, &item.data) {
             return;
@@ -101,7 +101,7 @@ pub async fn enqueue_packet(
     // Per-stream queue
     let mut streams = state.active_streams.lock().await;
     if let Some(sd) = streams.get_mut(&stream_id) {
-        let mut qm = state.queue_manager.lock().await;
+        let qm = state.queue_manager.lock().await;
         if !qm.track_stream_packet_once(&mut sd.queue_owner, ptype, sn, &item.data) {
             return;
         }
@@ -131,7 +131,7 @@ pub async fn enqueue_packet(
 
     if is_terminal {
         drop(streams);
-        let mut qm = state.queue_manager.lock().await;
+        let qm = state.queue_manager.lock().await;
         let mut owner = state.main_queue_owner.lock().await;
         if !qm.track_main_packet_once(&mut owner, stream_id, ptype, sn, &item.data) {
             return;

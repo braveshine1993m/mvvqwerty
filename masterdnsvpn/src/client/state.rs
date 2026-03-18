@@ -171,26 +171,15 @@ impl ClientState {
     }
 
     pub fn new_stream_id(&self) -> Option<u16> {
-        let start = self.last_stream_id.load(Ordering::Relaxed).wrapping_add(1).max(1);
-        let mut id = start;
-        let mut wrapped = false;
-
-        loop {
-            if self.is_stopping() {
-                return None;
-            }
-            if id == 0 || id > 65535 {
-                if wrapped {
-                    return None;
-                }
-                id = 1;
-                wrapped = true; // mark wrap-around
-            }
-            // We cannot check active_streams synchronously here because it's behind
-            // an async Mutex. The caller must validate after acquiring the lock.
-            self.last_stream_id.store(id, Ordering::Relaxed);
-            return Some(id);
+        if self.is_stopping() {
+            return None;
         }
+        let start = self.last_stream_id.load(Ordering::Relaxed).wrapping_add(1);
+        let id = if start == 0 || start > 65535 { 1 } else { start };
+        // We cannot check active_streams synchronously here because it's behind
+        // an async Mutex. The caller must validate after acquiring the lock.
+        self.last_stream_id.store(id, Ordering::Relaxed);
+        Some(id)
     }
 
     pub fn expected_inbound_session_cookie(&self, packet_type: u8) -> u16 {
