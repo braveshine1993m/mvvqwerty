@@ -4,7 +4,6 @@
 // Year: 2026
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::dns_utils::compression::{compress_payload, try_decompress_payload, CompressionType};
 use crate::dns_utils::dns_enums::PacketType;
@@ -119,10 +118,10 @@ async fn process_session_packet(
     state: &Arc<ServerState>,
     packet_type: u8,
     session_id: u8,
-    data: &[u8],
+    _data: &[u8],
     labels: &str,
     extracted_header: &VpnHeaderData,
-    addr: std::net::SocketAddr,
+    _addr: std::net::SocketAddr,
 ) {
     let stream_id = extracted_header.stream_id.unwrap_or(0);
     let sn = extracted_header.sequence_num.unwrap_or(0);
@@ -528,7 +527,7 @@ async fn handle_control_ack(
     packet_type: u8,
 ) {
     // Check if it's a SOCKS5 error ACK
-    if let Some(&original_ptype) = state.socks5_error_ack_map.get(&packet_type) {
+    if let Some(&_original_ptype) = state.socks5_error_ack_map.get(&packet_type) {
         // The client acknowledged our SOCKS5 error — no further action needed
         return;
     }
@@ -550,7 +549,7 @@ async fn handle_packed_control_blocks(
     state: &Arc<ServerState>,
     session_id: u8,
     payload: &[u8],
-    original_header: &VpnHeaderData,
+    _original_header: &VpnHeaderData,
 ) {
     let mut offset = 0;
     while offset + PACKED_CONTROL_BLOCK_SIZE <= payload.len() {
@@ -661,7 +660,7 @@ async fn build_piggybacked_response(
     session_id: u8,
     request_domain: &str,
     question_packet: &[u8],
-    extracted_header: &VpnHeaderData,
+    _extracted_header: &VpnHeaderData,
 ) -> Option<Vec<u8>> {
     let mut sessions = state.sessions.lock().await;
     let session = match sessions.get_mut(&session_id) {

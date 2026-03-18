@@ -5,11 +5,11 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::dns_utils::arq::{Arq, ArqConfig};
 use crate::dns_utils::dns_packet_parser::DnsPacketParser;

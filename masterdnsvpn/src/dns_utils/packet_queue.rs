@@ -69,8 +69,6 @@ pub enum TrackKey {
     ScopedType(u16, u8),
 }
 
-lazy_static_priority_zero! {}
-
 // Sets defined at module level (mirrors Python class-level frozensets)
 fn priority_zero_types() -> HashSet<u8> {
     [

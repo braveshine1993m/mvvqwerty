@@ -9,8 +9,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::dns_utils::dns_enums::PacketType;
-
 use super::state::ClientState;
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use crate::dns_utils::compression::{compress_payload, CompressionType};
-use crate::dns_utils::dns_enums::{DnsRecordType, PacketType};
+use crate::dns_utils::dns_enums::DnsRecordType;
 use crate::dns_utils::packet_queue::QueueItem;
 
 use super::connection;

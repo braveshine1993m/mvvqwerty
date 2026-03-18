@@ -4,7 +4,6 @@
 // Year: 2026
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,7 +39,7 @@ pub async fn expected_session_cookie(
 pub fn should_emit_invalid_cookie_error(
     packet_type: u8,
     expected: Option<u8>,
-    received: u8,
+    _received: u8,
 ) -> bool {
     // Don't emit for pre-session or if session simply doesn't exist
     if expected.is_none() {

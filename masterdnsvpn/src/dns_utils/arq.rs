@@ -184,7 +184,7 @@ impl Arq {
         enqueue_tx_cb: EnqueueTxCb,
         enqueue_control_tx_cb: EnqueueControlTxCb,
         reader: OwnedReadHalf,
-        writer: OwnedWriteHalf,
+        _writer: OwnedWriteHalf,
         mtu: usize,
         config: ArqConfig,
         initial_data: Vec<u8>,
@@ -487,7 +487,7 @@ impl Arq {
             if closed { break; }
 
             let base_interval = {
-                let inner = self.inner.lock().await;
+                let _inner = self.inner.lock().await;
                 let rto = self.config.rto;
                 let ctrl_rto = if self.config.enable_control_reliability {
                     self.config.control_rto
@@ -568,10 +568,13 @@ impl Arq {
 
             // Deliver in-order data
             let mut data_to_write = Vec::new();
-            while inner.rcv_buf.contains_key(&inner.rcv_nxt) {
-                if let Some(d) = inner.rcv_buf.remove(&inner.rcv_nxt) {
+            loop {
+                let nxt = inner.rcv_nxt;
+                if let Some(d) = inner.rcv_buf.remove(&nxt) {
                     data_to_write.push(d);
-                    inner.rcv_nxt = inner.rcv_nxt.wrapping_add(1);
+                    inner.rcv_nxt = nxt.wrapping_add(1);
+                } else {
+                    break;
                 }
             }
             drop(inner);
@@ -604,7 +607,7 @@ impl Arq {
         }
     }
 
-    async fn try_finalize_remote_eof(&self, writer: &mut OwnedWriteHalf) {
+    async fn try_finalize_remote_eof(&self, _writer: &mut OwnedWriteHalf) {
         let mut inner = self.inner.lock().await;
         if inner.closed || inner.remote_write_closed || !inner.fin_received {
             return;

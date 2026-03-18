@@ -6,10 +6,8 @@
 use std::sync::Arc;
 
 use crate::dns_utils::dns_enums::PacketType;
-use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 
 use super::config::PACKED_CONTROL_BLOCK_SIZE;
-use super::session;
 use super::state::ServerState;
 
 // ---------------------------------------------------------------------------
@@ -20,7 +18,7 @@ use super::state::ServerState;
 pub async fn handle_set_mtu(
     state: &Arc<ServerState>,
     session_id: u8,
-    data: &[u8],
+    _data: &[u8],
     labels: &str,
     request_domain: &str,
     question_packet: &[u8],

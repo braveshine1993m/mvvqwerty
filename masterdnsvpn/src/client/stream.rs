@@ -7,14 +7,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::net::TcpStream;
-
 use crate::dns_utils::arq::Arq;
 use crate::dns_utils::dns_enums::PacketType;
 use crate::dns_utils::packet_queue::{PacketQueueManager, QueueOwner};
 
 use super::queue;
-use super::state::{ClientState, StreamData};
+use super::state::ClientState;
 
 // ---------------------------------------------------------------------------
 // Stream ID allocation (mirrors Python _new_get_stream_id)

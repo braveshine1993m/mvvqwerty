@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::dns_utils::dns_enums::PacketType;
-use crate::dns_utils::dns_packet_parser::{DnsPacketParser, VpnHeaderData};
+use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 
 use super::packet_handler;
 use super::session;
@@ -34,7 +34,13 @@ pub async fn handle_single_request(
     };
 
     // Validate domain
-    let qname = dns_packet.qname.to_lowercase();
+    let qname = match dns_packet.questions.first() {
+        Some(q) => q.qname.to_lowercase(),
+        None => {
+            send_servfail(state, raw_data, addr).await;
+            return;
+        }
+    };
     if !is_allowed_domain(state, &qname) {
         send_servfail(state, raw_data, addr).await;
         return;

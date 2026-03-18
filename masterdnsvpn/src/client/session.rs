@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::dns_utils::compression::{normalize_compression_type, CompressionType};
 use crate::dns_utils::dns_enums::{DnsRecordType, PacketType};
 use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 

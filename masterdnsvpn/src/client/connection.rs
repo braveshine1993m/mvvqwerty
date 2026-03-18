@@ -5,16 +5,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::dns_utils::config_loader::{get_config_path, TomlValueExt};
 use crate::dns_utils::dns_balancer::ResolverInfo;
-use crate::dns_utils::dns_enums::PacketType;
 use crate::dns_utils::utils;
 
-use super::state::{ClientState, ConnectionEntry, StreamData};
+use super::state::{ClientState, ConnectionEntry};
 
 // ---------------------------------------------------------------------------
 // Resolver loading from config + file
@@ -77,7 +74,6 @@ pub async fn create_connection_map(state: &Arc<ClientState>) {
                 domain: info.domain.clone(),
                 resolver: info.resolver.clone(),
                 resolver_addr: addr,
-                is_direct: info.is_direct,
             });
         }
     }
@@ -94,7 +90,7 @@ pub async fn create_connection_map(state: &Arc<ClientState>) {
 /// Uses the balancer for best-server selection and respects packet_duplication_count.
 pub async fn select_target_connections(
     state: &Arc<ClientState>,
-    packet_type: u8,
+    _packet_type: u8,
     stream_id: u16,
 ) -> Vec<ConnectionEntry> {
     let conn_map = state.connection_map.lock().await;

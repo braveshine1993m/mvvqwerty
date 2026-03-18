@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::net::UdpSocket;
-use std::path::Path;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::EnvFilter;
@@ -101,7 +100,7 @@ pub fn generate_random_hex_text(length: usize) -> String {
     use rand::Rng;
     let byte_len = (length + 1) / 2;
     let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..byte_len).map(|_| rng.gen()).collect();
+    let bytes: Vec<u8> = (0..byte_len).map(|_| rng.r#gen()).collect();
     let hex_str = hex::encode(&bytes);
     hex_str[..length].to_string()
 }

@@ -4,9 +4,7 @@
 // Year: 2026
 
 use std::sync::Arc;
-use std::time::Instant;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::dns_utils::dns_enums::PacketType;
@@ -336,7 +334,7 @@ async fn send_socks5_error_packet(
     session_id: u8,
     stream_id: u16,
     error_packet_type: u8,
-    fragment_id: Option<u8>,
+    _fragment_id: Option<u8>,
 ) {
     queue::enqueue_packet(
         state,
@@ -360,7 +358,7 @@ pub async fn handle_socks5_syn(
     state: &Arc<ServerState>,
     session_id: u8,
     stream_id: u16,
-    sn: u16,
+    _sn: u16,
     payload: Vec<u8>,
     fragment_id: Option<u16>,
     total_fragments: Option<u16>,

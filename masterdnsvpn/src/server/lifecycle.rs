@@ -66,7 +66,7 @@ pub async fn run() {
     };
 
     // Set socket buffer sizes
-    utils::set_socket_buffer_sizes(&udp_sock, 4 * 1024 * 1024, 4 * 1024 * 1024);
+    utils::set_socket_buffer_size(&udp_sock, 4 * 1024 * 1024);
 
     *state.udp_sock.lock().await = Some(udp_sock.clone());
     tracing::info!("Listening on {} (UDP)", bind_addr);

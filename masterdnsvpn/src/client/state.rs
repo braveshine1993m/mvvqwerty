@@ -16,7 +16,7 @@ use crate::dns_utils::arq::{Arq, ArqConfig};
 use crate::dns_utils::dns_balancer::DNSBalancer;
 use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 use crate::dns_utils::packet_queue::{PacketQueueManager, QueueItem, QueueOwner};
-use crate::dns_utils::ping_manager::PingManager;
+
 
 // ---------------------------------------------------------------------------
 // Per-stream data stored on the client
@@ -81,7 +81,6 @@ pub struct ConnectionEntry {
     pub domain: String,
     pub resolver: String,
     pub resolver_addr: SocketAddr,
-    pub is_direct: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +184,7 @@ impl ClientState {
                     return None;
                 }
                 id = 1;
-                wrapped = true;
+                wrapped = true; // mark wrap-around
             }
             // We cannot check active_streams synchronously here because it's behind
             // an async Mutex. The caller must validate after acquiring the lock.

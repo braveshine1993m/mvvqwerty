@@ -3,7 +3,6 @@
 // Github: https://github.com/masterking32
 // Year: 2026
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -216,7 +215,7 @@ pub async fn retransmit_worker(state: &Arc<ClientState>) {
         let mut closed = state.closed_streams.lock().await;
         let expired: Vec<u16> = closed
             .iter()
-            .filter(|(_, &t)| now.duration_since(t).as_secs_f64() > 45.0)
+            .filter(|(_, t)| now.duration_since(*t).as_secs_f64() > 45.0)
             .map(|(&k, _)| k)
             .collect();
         for k in expired {

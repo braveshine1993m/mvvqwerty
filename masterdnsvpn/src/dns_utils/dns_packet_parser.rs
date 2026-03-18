@@ -8,18 +8,15 @@ use std::collections::HashSet;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use base32;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, STANDARD_NO_PAD};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Sha256;
 
 use super::dns_enums::{DnsQClass, DnsRCode, DnsRecordType, PacketType};
-
-/// Lazily computed sets for packet type extensions.
-lazy_static_sets! {}
 
 // We'll use module-level functions and a struct instead of lazy_static
 
@@ -583,7 +580,7 @@ impl DnsPacketParser {
         }
 
         let mut rng = rand::thread_rng();
-        let pkt_id: u16 = rng.gen();
+        let pkt_id: u16 = rng.r#gen();
 
         let mut result = Vec::new();
         // Header
@@ -1182,9 +1179,9 @@ impl DnsPacketParser {
         encode_data: bool,
         stream_id: u16,
         sequence_num: u16,
-        fragment_id: u8,
-        total_fragments: u8,
-        total_data_length: u16,
+        _fragment_id: u8,
+        _total_fragments: u8,
+        _total_data_length: u16,
         compression_type: u8,
         session_cookie: u8,
     ) -> Vec<String> {

@@ -8,7 +8,7 @@
 // https://en.wikipedia.org/wiki/List_of_DNS_record_types
 // https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml
 
-#[allow(non_upper_camel_case_types)]
+#[allow(non_camel_case_types)]
 pub struct PacketType;
 
 impl PacketType {

@@ -6,14 +6,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::net::TcpStream;
-
 use crate::dns_utils::arq::Arq;
 use crate::dns_utils::dns_enums::PacketType;
 use crate::dns_utils::packet_queue::{PacketQueueManager, QueueOwner};
 
 use super::queue;
-use super::state::{ServerState, ServerStreamData};
+use super::state::ServerState;
 
 // ---------------------------------------------------------------------------
 // Close stream (mirrors Python close_stream on server)
