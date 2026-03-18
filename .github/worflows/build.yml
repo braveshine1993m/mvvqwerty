@@ -1,0 +1,130 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }}, ${{ matrix.os }}, ${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: Linux_AMD64
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: Linux_ARM64
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: Windows_AMD64
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macOS_ARM64
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux)
+        if: contains(matrix.target, 'musl') && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        working-directory: .
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        working-directory: .
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare build directory (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          rm -rf dist dist-client || true
+          mkdir -p dist dist-client
+
+      - name: Package server (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/masterdnsvpn-server dist/ 2>/dev/null || true
+          cp masterdnsvpn/server_config.toml.simple dist/server_config.toml
+          cp masterdnsvpn/server_linux_install.sh dist/ 2>/dev/null || true
+          chmod +x dist/masterdnsvpn-server dist/server_linux_install.sh 2>/dev/null || true
+          cd dist && zip -r ../MasterDnsVPN_Server_${{ matrix.name }}.zip .
+
+      - name: Package client (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/masterdnsvpn-client dist-client/ 2>/dev/null || true
+          cp masterdnsvpn/client_config.toml.simple dist-client/client_config.toml
+          cp masterdnsvpn/client_resolvers.simple.txt dist-client/client_resolvers.txt
+          chmod +x dist-client/masterdnsvpn-client 2>/dev/null || true
+          cd dist-client && zip -r ../MasterDnsVPN_Client_${{ matrix.name }}.zip .
+
+      - name: Package server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item "target\${{ matrix.target }}\release\masterdnsvpn-server.exe" dist\
+          Copy-Item "masterdnsvpn\server_config.toml.simple" dist\server_config.toml
+          Compress-Archive -Path dist\* -DestinationPath "MasterDnsVPN_Server_${{ matrix.name }}.zip"
+
+      - name: Package client (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-client
+          Copy-Item "target\${{ matrix.target }}\release\masterdnsvpn-client.exe" dist-client\
+          Copy-Item "masterdnsvpn\client_config.toml.simple" dist-client\client_config.toml
+          Copy-Item "masterdnsvpn\client_resolvers.simple.txt" dist-client\client_resolvers.txt
+          Compress-Archive -Path dist-client\* -DestinationPath "MasterDnsVPN_Client_${{ matrix.name }}.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.name }}
+          path: |
+            *.zip
+
+  release:
+    name: Create Release and attach artifacts
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.zip
+          generate_release_notes: true
