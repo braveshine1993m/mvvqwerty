@@ -1,0 +1,167 @@
+# ==============================================================================
+# MasterDnsVPN Client Configuration (Sample) - Rust Edition
+# Author: MasterkinG32 (Github: https://github.com/masterking32)
+# Year: 2026
+# ------------------------------------------------------------------------------
+# This sample is synchronized with the Rust client code paths.
+# Copy this file to 'client_config.toml' and edit as needed.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) Core Tunnel & Protocol
+# ------------------------------------------------------------------------------
+
+# Transport protocol between client and server:
+# - "SOCKS5": optimized proxy mode (recommended for normal browsing/apps)
+# - "TCP": raw TCP tunnel mode (for forwarding other protocols)
+PROTOCOL_TYPE = "SOCKS5"
+
+# Must match server DOMAIN values.
+DOMAINS = ["v.domain.com"]
+
+# Encryption method:
+# 0=None, 1=XOR, 2=ChaCha20, 3=AES-128-GCM, 4=AES-192-GCM, 5=AES-256-GCM
+# Must match server DATA_ENCRYPTION_METHOD.
+DATA_ENCRYPTION_METHOD = 1
+
+# Shared secret key with server (required on client).
+ENCRYPTION_KEY = ""
+
+# ------------------------------------------------------------------------------
+# 2) Local Listener & Local SOCKS Authentication
+# ------------------------------------------------------------------------------
+
+# Local bind endpoint for apps.
+LISTEN_IP = "0.0.0.0"
+LISTEN_PORT = 1080
+
+# Local SOCKS auth (applies when PROTOCOL_TYPE="SOCKS5").
+# This is for clients connecting to THIS local proxy, not server auth.
+SOCKS5_AUTH = true
+SOCKS5_USER = "master_dns_vpn"
+SOCKS5_PASS = "master_dns_vpn"
+
+# Maximum time (seconds) allowed for SOCKS handshake completion per stream.
+SOCKS_HANDSHAKE_TIMEOUT = 300.0
+
+# ------------------------------------------------------------------------------
+# 3) Resolver Selection & DNS Strategy
+# ------------------------------------------------------------------------------
+
+# Resolver pool is loaded from client_resolvers.txt (next to executable).
+# Supported formats per line:
+# - IP            (e.g. 1.1.1.1)
+# - IP:PORT       (e.g. 1.1.1.1:5353)
+# - CIDR          (e.g. 1.1.1.0/24)
+# - CIDR:PORT     (e.g. 1.1.1.0/24:99)
+
+# Send each DNS query N times for reliability in lossy networks.
+# 1 = no duplication. 2 is the recommended starting point for unstable links.
+PACKET_DUPLICATION_COUNT = 2
+
+# Stream-level soft affinity: after this many STREAM_RESEND packets in a row,
+# switch the stream's preferred resolver if another active resolver is available.
+STREAM_RESOLVER_FAILOVER_RESEND_THRESHOLD = 2
+# Minimum seconds between preferred-resolver switches for the same stream.
+STREAM_RESOLVER_FAILOVER_COOLDOWN = 1.0
+
+# Max packet/control blocks packed per DNS operation (user upper bound).
+# Runtime value = min(MAX_PACKETS_PER_BATCH, MTU-based upload limit).
+MAX_PACKETS_PER_BATCH = 100
+
+# Resolver balancing strategy:
+# 1=random, 2=round-robin, 3=least-loss, 4=lowest-latency
+RESOLVER_BALANCING_STRATEGY = 2
+
+# If true, asks server to base-encode DNS payloads (more compatible, less efficient).
+BASE_ENCODE_DATA = false
+
+# Timeout (seconds) for normal DNS query/response operations.
+DNS_QUERY_TIMEOUT = 5.0
+
+# Compression for client -> server payloads (upload direction).
+# 0=OFF, 1=ZSTD, 2=LZ4, 3=ZLIB
+UPLOAD_COMPRESSION_TYPE = 0
+
+# Compression for server -> client payloads (download direction).
+# 0=OFF, 1=ZSTD, 2=LZ4, 3=ZLIB
+DOWNLOAD_COMPRESSION_TYPE = 0
+
+# ------------------------------------------------------------------------------
+# 4) MTU Discovery
+# ------------------------------------------------------------------------------
+
+# Minimum accepted MTU values during resolver validation (0 disables each bound).
+MIN_UPLOAD_MTU = 70
+MIN_DOWNLOAD_MTU = 150
+
+# Initial upper bounds for MTU probing.
+MAX_UPLOAD_MTU = 150
+MAX_DOWNLOAD_MTU = 200
+
+# MTU test aggressiveness.
+MTU_TEST_RETRIES = 2
+MTU_TEST_TIMEOUT = 2.0
+
+# Auto profile scaling by resolver-domain count (small/medium/large).
+AUTO_SCALE_PROFILES = true
+
+# Number of resolver-domain pairs tested in parallel during initial MTU scan.
+MTU_TEST_PARALLELISM = 6
+
+# If true, successful MTU-tested resolvers are saved to file.
+SAVE_MTU_SERVERS_TO_FILE = false
+
+# Auto-disable a resolver/domain pair during runtime if it has 100% timeouts.
+AUTO_DISABLE_TIMEOUT_SERVERS = true
+AUTO_DISABLE_TIMEOUT_WINDOW_SECONDS = 120
+AUTO_DISABLE_TIMEOUT_MIN_OBSERVATIONS = 3
+AUTO_DISABLE_CHECK_INTERVAL_SECONDS = 1.0
+
+# Recheck invalid servers periodically.
+RECHECK_INACTIVE_SERVERS_ENABLED = true
+RECHECK_INACTIVE_INTERVAL_SECONDS = 300
+RECHECK_SERVER_INTERVAL_SECONDS = 3.0
+RECHECK_BATCH_SIZE = 5
+
+# ------------------------------------------------------------------------------
+# 5) ARQ / Reliability
+# ------------------------------------------------------------------------------
+
+# Session initialization retry count.
+MAX_CONNECTION_ATTEMPTS = 10
+
+# Data-plane ARQ settings.
+ARQ_WINDOW_SIZE = 1000
+ARQ_INITIAL_RTO = 0.5
+ARQ_MAX_RTO = 3.0
+
+# Control-plane ARQ settings (SYN/FIN/RST/SOCKS control packets).
+ARQ_CONTROL_INITIAL_RTO = 0.5
+ARQ_CONTROL_MAX_RTO = 3.0
+ARQ_CONTROL_MAX_RETRIES = 80
+
+# ------------------------------------------------------------------------------
+# 6) Runtime Performance & Memory Caps
+# ------------------------------------------------------------------------------
+
+# Worker counts for receive and DNS TX loops.
+NUM_RX_WORKERS = 2
+NUM_DNS_WORKERS = 2
+
+# Max in-flight RX packet processing tasks.
+RX_SEMAPHORE_LIMIT = 500
+
+# Max closed-stream records retained for duplicate-close protection.
+MAX_CLOSED_STREAM_RECORDS = 2000
+
+# UDP socket buffer bytes.
+SOCKET_BUFFER_SIZE = 8388608
+
+# Log level: DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL = "INFO"
+
+# ------------------------------------------------------------------------------
+# 7) Version Marker
+# ------------------------------------------------------------------------------
+CONFIG_VERSION = 5.0

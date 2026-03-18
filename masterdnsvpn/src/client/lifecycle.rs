@@ -1,0 +1,587 @@
+// MasterDnsVPN Client - Application Lifecycle
+// Author: MasterkinG32
+// Github: https://github.com/masterking32
+// Year: 2026
+
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{Mutex, Notify, Semaphore};
+
+use crate::dns_utils::arq::ArqConfig;
+use crate::dns_utils::compression::normalize_compression_type;
+use crate::dns_utils::config_loader::{load_config, TomlValueExt};
+use crate::dns_utils::dns_balancer::{BalancerStrategy, DNSBalancer};
+use crate::dns_utils::dns_enums::PacketType;
+use crate::dns_utils::dns_packet_parser::DnsPacketParser;
+use crate::dns_utils::packet_queue::{PacketQueueManager, QueueOwner};
+use crate::dns_utils::ping_manager::PingManager;
+use crate::dns_utils::utils;
+
+use super::config;
+use super::connection;
+use super::health;
+use super::mtu;
+use super::queue;
+use super::retransmit;
+use super::rx;
+use super::session;
+use super::socks5;
+use super::state::{ClientState, StreamData};
+use super::stream;
+use super::tx;
+
+// ---------------------------------------------------------------------------
+// Client entry point
+// ---------------------------------------------------------------------------
+
+pub async fn run() {
+    println!("MasterDnsVPN Client v{}", config::BUILD_VERSION);
+    println!("Loading configuration...");
+
+    let cfg = load_config(config::DEFAULT_CONFIG_FILE);
+    if cfg.is_empty() {
+        eprintln!(
+            "Error: Configuration file '{}' not found or empty.",
+            config::DEFAULT_CONFIG_FILE
+        );
+        eprintln!(
+            "Hint: Copy 'client_config.toml.simple' to '{}' and edit it.",
+            config::DEFAULT_CONFIG_FILE
+        );
+        std::process::exit(1);
+    }
+
+    let state = build_client_state(&cfg);
+
+    // Handle Ctrl+C
+    let state_ctrlc = state.clone();
+    ctrlc::set_handler(move || {
+        tracing::info!("Shutting down...");
+        state_ctrlc.running.store(false, Ordering::SeqCst);
+        std::process::exit(0);
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    // Main reconnect loop
+    while state.running.load(Ordering::Relaxed) {
+        state.session_restart.store(false, Ordering::SeqCst);
+        state.session_established.store(false, Ordering::SeqCst);
+
+        // Bind UDP tunnel socket
+        let tunnel_sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::error!("Failed to bind tunnel UDP socket: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        *state.tunnel_sock.lock().await = Some(tunnel_sock.clone());
+
+        // Build connection map
+        connection::create_connection_map(&state).await;
+
+        // Session init
+        match session::init_session(&state, &tunnel_sock).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Session established (id={}, cookie={})",
+                    state.session_id.load(Ordering::Relaxed),
+                    state.session_cookie.load(Ordering::Relaxed)
+                );
+                state.session_established.store(true, Ordering::SeqCst);
+            }
+            Err(e) => {
+                tracing::error!("Session init failed: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        }
+
+        // Sync MTU with server
+        if let Err(e) = mtu::sync_mtu_with_server(&state, &tunnel_sock).await {
+            tracing::warn!("MTU sync failed: {}", e);
+        }
+
+        // Start TCP listener + workers
+        let bind_addr = format!("{}:{}", state.listen_ip, state.listen_port);
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind listener on {}: {}", bind_addr, e);
+                std::process::exit(1);
+            }
+        };
+        tracing::info!("Listening on {}", bind_addr);
+
+        run_tunnel_loop(&state, &tunnel_sock, listener).await;
+
+        // Cleanup after disconnect
+        stream::clear_runtime_state(&state).await;
+
+        if !state.running.load(Ordering::Relaxed) {
+            break;
+        }
+        tracing::warn!("Restarting client workflow in 2 seconds...");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build ClientState from config
+// ---------------------------------------------------------------------------
+
+fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
+    let protocol_type = cfg.get_str_or("PROTOCOL_TYPE", "SOCKS5");
+    let domains = cfg.get_string_array("DOMAINS");
+    if domains.is_empty() {
+        eprintln!("Error: DOMAINS must be set in config.");
+        std::process::exit(1);
+    }
+
+    let encryption_method = cfg.get_i64_or("DATA_ENCRYPTION_METHOD", 1) as u8;
+    let encryption_key_cfg = cfg.get_str_or("ENCRYPTION_KEY", "");
+    let encryption_key = if encryption_key_cfg.is_empty() {
+        utils::get_encrypt_key(encryption_method)
+    } else {
+        encryption_key_cfg
+    };
+
+    let listen_ip = cfg.get_str_or("LISTEN_IP", "0.0.0.0");
+    let listen_port = cfg.get_i64_or("LISTEN_PORT", 1080) as u16;
+    let socks5_auth = cfg.get_bool_or("SOCKS5_AUTH", false);
+    let socks5_user = cfg.get_str_or("SOCKS5_USER", "");
+    let socks5_pass = cfg.get_str_or("SOCKS5_PASS", "");
+
+    let upload_comp = normalize_compression_type(
+        cfg.get_i64_or("UPLOAD_COMPRESSION_TYPE", 0) as u8,
+    );
+    let download_comp = normalize_compression_type(
+        cfg.get_i64_or("DOWNLOAD_COMPRESSION_TYPE", 0) as u8,
+    );
+    let compression_min_size = cfg.get_i64_or("COMPRESSION_MIN_SIZE", 64) as usize;
+
+    let packet_dup = (cfg.get_i64_or("PACKET_DUPLICATION_COUNT", 2) as usize).max(1);
+    let socks_handshake_timeout = cfg.get_f64_or("SOCKS_HANDSHAKE_TIMEOUT", 300.0);
+
+    let arq_window = cfg.get_i64_or("ARQ_WINDOW_SIZE", 1000) as usize;
+    let arq_rto = cfg.get_f64_or("ARQ_INITIAL_RTO", 0.5);
+    let arq_max_rto = cfg.get_f64_or("ARQ_MAX_RTO", 3.0);
+    let arq_ctrl_rto = cfg.get_f64_or("ARQ_CONTROL_INITIAL_RTO", 0.5);
+    let arq_ctrl_max_rto = cfg.get_f64_or("ARQ_CONTROL_MAX_RTO", 3.0);
+    let arq_ctrl_retries = cfg.get_i64_or("ARQ_CONTROL_MAX_RETRIES", 80) as u32;
+
+    let num_rx_workers = cfg.get_i64_or("NUM_RX_WORKERS", 2) as usize;
+    let rx_sem_limit = cfg.get_i64_or("RX_SEMAPHORE_LIMIT", 500) as usize;
+    let max_packed_blocks = cfg.get_i64_or("MAX_PACKETS_PER_BATCH", 100) as usize;
+    let log_level = cfg.get_str_or("LOG_LEVEL", "INFO");
+
+    utils::init_logger(&log_level, None, 0, 0, false);
+
+    tracing::info!("Protocol: {}", protocol_type);
+    tracing::info!("Domains: {:?}", domains);
+    tracing::info!("Encryption: method={}", encryption_method);
+    tracing::info!("Listen: {}:{}", listen_ip, listen_port);
+    tracing::info!("Compression: up={}, down={}", upload_comp, download_comp);
+
+    let parser = Arc::new(DnsPacketParser::new(&encryption_key, encryption_method));
+
+    let (mtu_chars, mtu_bytes) = parser.calculate_upload_mtu(&domains[0], 0);
+    tracing::info!("Upload MTU: {} chars, {} bytes", mtu_chars, mtu_bytes);
+
+    let resolvers = connection::load_resolvers(cfg, &domains);
+    if resolvers.is_empty() {
+        eprintln!("Error: No valid resolvers found.");
+        std::process::exit(1);
+    }
+    tracing::info!("Loaded {} resolver(s)", resolvers.len());
+
+    let strategy = BalancerStrategy::from(cfg.get_i64_or("RESOLVER_BALANCING_STRATEGY", 2));
+    let balancer = DNSBalancer::new(resolvers, strategy);
+
+    let arq_config = ArqConfig {
+        window_size: arq_window,
+        rto: arq_rto,
+        max_rto: arq_max_rto,
+        is_socks: protocol_type == "SOCKS5",
+        enable_control_reliability: true,
+        control_rto: arq_ctrl_rto,
+        control_max_rto: arq_ctrl_max_rto,
+        control_max_retries: arq_ctrl_retries,
+        ..ArqConfig::default()
+    };
+
+    Arc::new(ClientState {
+        session_id: AtomicU16::new(0),
+        session_cookie: AtomicU16::new(0),
+        session_established: AtomicBool::new(false),
+        session_restart: AtomicBool::new(false),
+        upload_mtu_chars: AtomicUsize::new(mtu_chars),
+        upload_mtu_bytes: AtomicUsize::new(mtu_bytes),
+        download_mtu_bytes: AtomicUsize::new(200),
+        synced_upload_mtu_chars: AtomicUsize::new(mtu_chars),
+        safe_uplink_mtu: AtomicUsize::new(mtu_bytes),
+        success_mtu_checks: AtomicBool::new(false),
+        active_streams: Mutex::new(HashMap::new()),
+        closed_streams: Mutex::new(HashMap::new()),
+        last_stream_id: AtomicU16::new(0),
+        running: AtomicBool::new(true),
+        total_upload: AtomicU64::new(0),
+        total_download: AtomicU64::new(0),
+        parser,
+        balancer: Mutex::new(balancer),
+        tunnel_sock: Mutex::new(None),
+        connection_map: Mutex::new(Vec::new()),
+        domains,
+        protocol_type,
+        socks5_auth,
+        socks5_user,
+        socks5_pass,
+        upload_compression: upload_comp,
+        download_compression: download_comp,
+        compression_min_size,
+        packet_duplication_count: packet_dup,
+        socks_handshake_timeout,
+        arq_config,
+        num_rx_workers,
+        rx_semaphore: Arc::new(Semaphore::new(rx_sem_limit)),
+        listen_ip,
+        listen_port,
+        queue_manager: Mutex::new(PacketQueueManager::new()),
+        main_queue: Mutex::new(BinaryHeap::new()),
+        main_queue_owner: Mutex::new(QueueOwner::default()),
+        tx_notify: Arc::new(Notify::new()),
+        enqueue_seq: AtomicU32::new(0),
+        active_response_ids: Mutex::new(Vec::new()),
+        active_response_set: Mutex::new(HashSet::new()),
+        round_robin_stream_id: AtomicU16::new(0),
+        count_ping: AtomicU32::new(0),
+        max_packed_blocks,
+        max_closed_stream_records: 500,
+        control_request_ack_map: config::control_request_ack_map(),
+        control_ack_types: config::control_ack_types(),
+        socks5_error_types: config::socks5_error_packet_types(),
+        socks5_error_reply_map: config::socks5_error_reply_map(),
+        packable_control_types: config::packable_control_types(),
+        pre_session_packet_types: config::pre_session_packet_types(),
+        server_send_counts: Mutex::new(HashMap::new()),
+        disabled_servers: Mutex::new(HashMap::new()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tunnel loop — spawns all workers and waits for session restart or shutdown
+// (mirrors Python _run_tunnel_loop / start)
+// ---------------------------------------------------------------------------
+
+async fn run_tunnel_loop(
+    state: &Arc<ClientState>,
+    sock: &Arc<UdpSocket>,
+    listener: TcpListener,
+) {
+    let mut tasks = Vec::new();
+
+    // RX workers
+    for _ in 0..state.num_rx_workers {
+        let s = state.clone();
+        let sk = sock.clone();
+        tasks.push(tokio::spawn(async move {
+            rx::rx_worker(&s, &sk).await;
+        }));
+    }
+
+    // TX worker
+    {
+        let s = state.clone();
+        let sk = sock.clone();
+        tasks.push(tokio::spawn(async move {
+            tx::tx_worker(&s, &sk).await;
+        }));
+    }
+
+    // Retransmit worker
+    {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            retransmit::retransmit_worker(&s).await;
+        }));
+    }
+
+    // Ping manager
+    {
+        let s = state.clone();
+        let send_fn = {
+            let s2 = s.clone();
+            Arc::new(move || {
+                queue::send_ping_packet(&s2);
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let pm = PingManager::new(send_fn);
+        tasks.push(tokio::spawn(async move {
+            pm.ping_loop().await;
+        }));
+    }
+
+    // Timeout guard
+    {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            health::timeout_guard_worker(&s, 120.0).await;
+        }));
+    }
+
+    // Inactive server recheck
+    {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            health::inactive_server_recheck_worker(&s, 30.0).await;
+        }));
+    }
+
+    // TCP listener — accept connections
+    let s = state.clone();
+    tasks.push(tokio::spawn(async move {
+        accept_loop(&s, listener).await;
+    }));
+
+    // Wait for session restart or shutdown
+    loop {
+        if state.is_stopping() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Cancel all background tasks
+    for t in tasks {
+        t.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TCP Accept loop
+// ---------------------------------------------------------------------------
+
+async fn accept_loop(state: &Arc<ClientState>, listener: TcpListener) {
+    loop {
+        if state.is_stopping() {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await {
+            Ok(Ok((tcp_stream, addr))) => {
+                if state.session_established.load(Ordering::Relaxed) {
+                    let sc = state.clone();
+                    tokio::spawn(async move {
+                        handle_client_connection(sc, tcp_stream, addr).await;
+                    });
+                }
+            }
+            Ok(Err(e)) => tracing::debug!("Accept error: {}", e),
+            Err(_) => {} // timeout — loop to recheck
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handle new local TCP connection (mirrors Python _handle_local_tcp_connection)
+// ---------------------------------------------------------------------------
+
+async fn handle_client_connection(
+    state: Arc<ClientState>,
+    mut tcp_stream: TcpStream,
+    addr: std::net::SocketAddr,
+) {
+    tracing::debug!("New connection from {}", addr);
+
+    let stream_id = match stream::allocate_stream_id(&state).await {
+        Some(id) => id,
+        None => {
+            tracing::warn!("Stream ID exhausted, rejecting connection from {}", addr);
+            return;
+        }
+    };
+
+    let is_socks5 = state.protocol_type == "SOCKS5";
+    let mut socks5_result = None;
+
+    if is_socks5 {
+        match socks5::handle_socks5_handshake(&state, &mut tcp_stream).await {
+            Ok(result) => {
+                socks5_result = Some(result);
+            }
+            Err(e) => {
+                tracing::debug!("SOCKS5 handshake failed for {}: {}", addr, e);
+                return;
+            }
+        }
+    }
+
+    let now = Instant::now();
+    let handshake_event = Arc::new(Notify::new());
+
+    // Create the stream data
+    let mut sd = StreamData::new(stream_id);
+    sd.handshake_event = Some(handshake_event.clone());
+
+    if let Some(ref result) = socks5_result {
+        sd.initial_payload = result.target_payload.clone();
+    }
+
+    {
+        let mut streams = state.active_streams.lock().await;
+        streams.insert(stream_id, sd);
+    }
+
+    if is_socks5 {
+        // Send SOCKS5_SYN with target payload
+        let target_payload = socks5_result
+            .as_ref()
+            .map(|r| r.target_payload.clone())
+            .unwrap_or_default();
+
+        queue::enqueue_packet(&state, 0, stream_id, 0, PacketType::SOCKS5_SYN, target_payload)
+            .await;
+        queue::send_ping_packet(&state);
+
+        // Wait for server response (SYN_ACK or error)
+        let timeout = std::time::Duration::from_secs_f64(state.socks_handshake_timeout);
+        match tokio::time::timeout(timeout, handshake_event.notified()).await {
+            Ok(()) => {
+                let streams = state.active_streams.lock().await;
+                let sd_check = match streams.get(&stream_id) {
+                    Some(s) => s,
+                    None => {
+                        let _ = tcp_stream
+                            .write_all(&socks5::build_socks5_fail_reply(
+                                &state.socks5_error_reply_map,
+                                PacketType::SOCKS5_CONNECT_FAIL,
+                            ))
+                            .await;
+                        return;
+                    }
+                };
+
+                if let Some(err_ptype) = sd_check.socks_error_packet {
+                    drop(streams);
+                    let _ = tcp_stream
+                        .write_all(&socks5::build_socks5_fail_reply(
+                            &state.socks5_error_reply_map,
+                            err_ptype,
+                        ))
+                        .await;
+                    stream::close_stream(&state, stream_id, "SOCKS5 error", true, false).await;
+                    return;
+                }
+
+                if sd_check.status != "ACTIVE" {
+                    drop(streams);
+                    let _ = tcp_stream
+                        .write_all(&socks5::build_socks5_fail_reply(
+                            &state.socks5_error_reply_map,
+                            PacketType::SOCKS5_CONNECT_FAIL,
+                        ))
+                        .await;
+                    stream::close_stream(&state, stream_id, "Stream not active", true, false)
+                        .await;
+                    return;
+                }
+                drop(streams);
+
+                // Send SOCKS5 success reply
+                if let Some(ref result) = socks5_result {
+                    let reply = socks5::build_socks5_success_reply(
+                        result.atyp,
+                        &result.target_addr_bytes,
+                        &result.target_port_bytes,
+                    );
+                    let _ = tcp_stream.write_all(&reply).await;
+                } else {
+                    let _ = tcp_stream
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+            }
+            Err(_) => {
+                tracing::debug!("SOCKS5 handshake timed out for stream {}", stream_id);
+                let _ = tcp_stream
+                    .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                stream::close_stream(&state, stream_id, "SOCKS5 handshake timeout", true, false)
+                    .await;
+                return;
+            }
+        }
+    } else {
+        // Non-SOCKS5: send STREAM_SYN and wait
+        queue::enqueue_packet(&state, 0, stream_id, 0, PacketType::STREAM_SYN, vec![]).await;
+
+        let timeout = std::time::Duration::from_secs_f64(state.socks_handshake_timeout);
+        match tokio::time::timeout(timeout, handshake_event.notified()).await {
+            Ok(()) => {
+                let streams = state.active_streams.lock().await;
+                if let Some(sd) = streams.get(&stream_id) {
+                    if sd.status != "ACTIVE" {
+                        drop(streams);
+                        stream::close_stream(
+                            &state,
+                            stream_id,
+                            "Stream SYN not ACKed",
+                            true,
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+            Err(_) => {
+                stream::close_stream(&state, stream_id, "SYN timeout", true, false).await;
+                return;
+            }
+        }
+    }
+
+    // Setup ARQ stream on the TCP connection
+    setup_arq_stream(state, tcp_stream, stream_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// ARQ Stream Setup (mirrors Python _create_client_arq_stream wiring)
+// ---------------------------------------------------------------------------
+
+async fn setup_arq_stream(state: Arc<ClientState>, tcp_stream: TcpStream, stream_id: u16) {
+    let (reader, writer) = tcp_stream.into_split();
+
+    let initial_data = {
+        let streams = state.active_streams.lock().await;
+        streams
+            .get(&stream_id)
+            .map(|sd| sd.initial_payload.clone())
+            .unwrap_or_default()
+    };
+
+    let arq = stream::create_client_arq_stream(&state, stream_id, reader, writer, initial_data);
+
+    // Notify socks connected if in SOCKS5 mode
+    if state.protocol_type == "SOCKS5" {
+        arq.notify_socks_connected();
+    }
+
+    // Store ARQ in stream data
+    let mut streams = state.active_streams.lock().await;
+    if let Some(sd) = streams.get_mut(&stream_id) {
+        sd.arq = Some(arq);
+        if sd.status == "PENDING" {
+            sd.status = "ACTIVE".to_string();
+        }
+    }
+
+    tracing::debug!("Stream {} ARQ established", stream_id);
+}

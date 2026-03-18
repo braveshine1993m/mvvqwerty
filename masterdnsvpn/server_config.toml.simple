@@ -1,0 +1,121 @@
+# ==============================================================================
+# MasterDnsVPN Server Configuration (Sample) - Rust Edition
+# Author: MasterkinG32 (Github: https://github.com/masterking32)
+# Year: 2026
+# ------------------------------------------------------------------------------
+# This sample is synchronized with the Rust server code paths.
+# Copy this file to 'server_config.toml' and edit as needed.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) DNS Listener & Domain Ownership
+# ------------------------------------------------------------------------------
+
+# UDP bind endpoint for DNS tunnel.
+# In production, UDP_PORT is typically 53.
+UDP_HOST = "0.0.0.0"
+UDP_PORT = 53
+
+# Domains handled by this server. (NS records)
+# Must match client DOMAINS.
+DOMAIN = ["v.domain.com"]
+
+# ------------------------------------------------------------------------------
+# 2) Protocol & Forwarding Topology
+# ------------------------------------------------------------------------------
+
+# Must match client PROTOCOL_TYPE.
+# - "SOCKS5": optimized mode
+# - "TCP": raw TCP forwarding mode
+PROTOCOL_TYPE = "SOCKS5"
+
+# SOCKS egress mode when PROTOCOL_TYPE="SOCKS5":
+# - false: direct-connect to target host:port (fastest)
+# - true: chain traffic through external SOCKS at FORWARD_IP:FORWARD_PORT
+USE_EXTERNAL_SOCKS5 = false
+
+# Forward target endpoint.
+# Used for TCP mode, and for SOCKS mode if USE_EXTERNAL_SOCKS5=true.
+FORWARD_IP = "127.0.0.1"
+FORWARD_PORT = 1080
+
+# Upstream SOCKS credentials (used only when USE_EXTERNAL_SOCKS5=true).
+SOCKS5_AUTH = false
+SOCKS5_USER = "admin"
+SOCKS5_PASS = "123456"
+
+# Max handshake activation timeout (seconds) for SOCKS streams.
+SOCKS_HANDSHAKE_TIMEOUT = 180.0
+
+# Max concurrent outbound SOCKS connect/handshake operations.
+MAX_CONCURRENT_SOCKS_CONNECTS = 16
+
+# If a non-pre-session packet arrives with an invalid session cookie, the server
+# does not force reconnect immediately. It only emits ERROR_DROP after this many
+# invalid-cookie hits for the same session inside the sliding window below.
+INVALID_COOKIE_ERROR_THRESHOLD = 10
+INVALID_COOKIE_WINDOW_SECONDS = 2.0
+
+# ------------------------------------------------------------------------------
+# 3) Encryption
+# ------------------------------------------------------------------------------
+
+# 0=None, 1=XOR, 2=ChaCha20, 3=AES-128-GCM, 4=AES-192-GCM, 5=AES-256-GCM
+# Must match client DATA_ENCRYPTION_METHOD.
+DATA_ENCRYPTION_METHOD = 1
+
+# Supported compression types accept for upload/download based on client requests.
+# 0=OFF, 1=ZSTD, 2=LZ4, 3=ZLIB
+SUPPORTED_UPLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
+SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
+
+# ------------------------------------------------------------------------------
+# 4) ARQ / Reliability
+# ------------------------------------------------------------------------------
+
+# Data-plane ARQ profile.
+ARQ_WINDOW_SIZE = 1000
+ARQ_INITIAL_RTO = 0.5
+ARQ_MAX_RTO = 3.0
+
+# Control-plane ARQ profile.
+ARQ_CONTROL_INITIAL_RTO = 0.5
+ARQ_CONTROL_MAX_RTO = 3.0
+ARQ_CONTROL_MAX_RETRIES = 80
+
+# ------------------------------------------------------------------------------
+# 5) Session Lifecycle
+# ------------------------------------------------------------------------------
+
+# Inactivity timeout per session (seconds).
+SESSION_TIMEOUT = 300
+
+# Cleanup interval for expired sessions (seconds).
+SESSION_CLEANUP_INTERVAL = 30
+
+# Maximum active sessions (hard protocol cap is 255).
+MAX_SESSIONS = 255
+
+# ------------------------------------------------------------------------------
+# 6) Runtime Throughput / Resource Limits
+# ------------------------------------------------------------------------------
+
+# Max queued DNS requests waiting for request workers.
+MAX_CONCURRENT_REQUESTS = 500
+
+# Fixed number of DNS request workers.
+DNS_REQUEST_WORKERS = 4
+
+# Max packed control blocks per response cycle (user upper bound).
+MAX_PACKETS_PER_BATCH = 1000
+
+# UDP socket buffer bytes.
+SOCKET_BUFFER_SIZE = 8388608
+
+# Log level: DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL = "INFO"
+
+# ------------------------------------------------------------------------------
+# 7) Version Marker
+# ------------------------------------------------------------------------------
+CONFIG_VERSION = 5.0
