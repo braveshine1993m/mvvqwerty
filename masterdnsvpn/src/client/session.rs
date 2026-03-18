@@ -1,4 +1,5 @@
 // MasterDnsVPN Client - Session Initialization
+// Mirrors Python _init_session exactly
 // Author: MasterkinG32
 // Github: https://github.com/masterking32
 // Year: 2026
@@ -7,176 +8,257 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::dns_utils::compression::{get_compression_name, normalize_compression_type};
 use crate::dns_utils::dns_enums::{DnsRecordType, PacketType};
 use crate::dns_utils::dns_packet_parser::DnsPacketParser;
 
 use super::state::ClientState;
 
 // ---------------------------------------------------------------------------
-// Session Init (mirrors Python _session_init)
+// Helper: send DNS query and wait for response
+// ---------------------------------------------------------------------------
+async fn send_and_receive_dns(
+    query_data: &[u8],
+    resolver_addr: SocketAddr,
+    timeout_secs: f64,
+) -> Option<Vec<u8>> {
+    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    if sock.send_to(query_data, resolver_addr).await.is_err() {
+        return None;
+    }
+
+    let mut buf = vec![0u8; 65535];
+    let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+    match tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session Init (mirrors Python _init_session exactly)
 // ---------------------------------------------------------------------------
 
-/// Perform the SESSION_INIT handshake with the server.
-/// Sends a SESSION_INIT packet with a random token and compression preferences,
-/// waits for SESSION_ACCEPT, and stores session_id + session_cookie.
 pub async fn init_session(
     state: &Arc<ClientState>,
-    sock: &Arc<tokio::net::UdpSocket>,
+    max_attempts: u32,
 ) -> Result<(), String> {
-    // Generate a random 16-byte session token
-    let session_token: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
+    tracing::info!("Initializing session ...");
 
-    // Build the compression preference byte:
-    //   high nibble = upload compression, low nibble = download compression
-    let comp_pref: u8 = ((state.upload_compression & 0x0F) << 4)
+    // Python: init_token = os.urandom(8).hex().encode("ascii")
+    let init_token_bytes: Vec<u8> = (0..8).map(|_| rand::random::<u8>()).collect();
+    let init_token = hex::encode(&init_token_bytes);
+    let init_token_ascii = init_token.as_bytes();
+
+    // Python: flag_byte = b"\x01" if self.base_encode_responses else b"\x00"
+    let flag_byte: u8 = if state.base_encode_responses { 0x01 } else { 0x00 };
+
+    // Python: compression_pref_byte = ((upload_comp & 0x0F) << 4) | (download_comp & 0x0F)
+    let compression_pref_byte: u8 = ((state.upload_compression & 0x0F) << 4)
         | (state.download_compression & 0x0F);
 
-    // Flag byte: 0 = base32, 1 = base64 (we default to base32 = 0)
-    let flag_byte: u8 = 0;
-
-    // Payload = token + flag + compression_pref
-    let mut payload = session_token.clone();
+    // Python: payload = init_token + flag_byte + compression_pref_byte
+    let mut payload = Vec::with_capacity(init_token_ascii.len() + 2);
+    payload.extend_from_slice(init_token_ascii);
     payload.push(flag_byte);
-    payload.push(comp_pref);
+    payload.push(compression_pref_byte);
 
-    let encrypted_payload = state.parser.codec_transform(&payload, true);
+    let encrypted_token = state.parser.codec_transform(&payload, true);
 
-    let domain = &state.domains[0];
-    let mtu_chars = state.upload_mtu_chars.load(Ordering::Relaxed);
+    let mtu_chars = state.synced_upload_mtu_chars.load(Ordering::Relaxed);
 
-    for attempt in 0..10u32 {
+    for overall_attempt in 0..max_attempts {
         if state.is_stopping() {
             return Err("Client shutting down".into());
         }
 
-        let queries = state.parser.build_request_dns_query(
-            domain,
+        // Get best server for this attempt (Python: self.balancer.get_best_server())
+        let (domain, resolver_addr, resolver_label) = {
+            let mut bal = state.balancer.lock().await;
+            match bal.get_best_server() {
+                Some(r) => {
+                    let addr: SocketAddr = match r.resolver.parse() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    };
+                    (r.domain.clone(), addr, r.resolver.clone())
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            }
+        };
+
+        let dns_queries = state.parser.build_request_dns_query(
+            &domain,
             0, // session_id = 0 for init
             PacketType::SESSION_INIT,
-            &encrypted_payload,
+            &encrypted_token,
             mtu_chars,
             true,
             DnsRecordType::TXT,
             0, 0, 0, 0, 0, 0, 0,
         );
-        if queries.is_empty() {
-            return Err("Failed to build SESSION_INIT query".into());
+
+        if dns_queries.is_empty() {
+            tracing::error!(
+                "Failed to build session init DNS query via {} for {}, Retrying...",
+                resolver_label,
+                domain
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
         }
 
-        // Get resolver
-        let resolver = {
-            let mut bal = state.balancer.lock().await;
-            match bal.get_best_server() {
-                Some(r) => r,
-                None => return Err("No resolvers available".into()),
+        for inner_attempt in 0..3u32 {
+            if state.is_stopping() {
+                return Err("Client shutting down".into());
             }
-        };
-        let resolver_addr: SocketAddr = resolver
-            .resolver
-            .parse()
-            .map_err(|e| format!("Invalid resolver addr: {}", e))?;
 
-        for query in &queries {
-            let _ = sock.send_to(query, resolver_addr).await;
-        }
+            let response = send_and_receive_dns(
+                &dns_queries[0],
+                resolver_addr,
+                2.0, // Python: self.timeout
+            )
+            .await;
 
-        // Wait for response
-        let mut buf = vec![0u8; 65535];
-        let timeout = std::time::Duration::from_secs_f64(2.0 + attempt as f64 * 0.5);
-        match tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => {
-                if let Some(parsed) = DnsPacketParser::parse_dns_packet(&buf[..n]) {
-                    let (hdr, data) = state.parser.extract_vpn_response(&parsed, true);
+            if let Some(resp) = response {
+                if let Some(parsed) = DnsPacketParser::parse_dns_packet(&resp) {
+                    let (hdr, data) =
+                        state.parser.extract_vpn_response(&parsed, state.base_encode_responses);
                     if let Some(h) = hdr {
                         if h.packet_type == PacketType::SESSION_ACCEPT {
-                            // Parse the response: token:session_id:comp_pref:cookie
-                            if let Some(result) =
-                                parse_session_accept_response(&data, &session_token)
-                            {
-                                state
-                                    .session_id
-                                    .store(result.session_id as u16, Ordering::SeqCst);
-                                state
-                                    .session_cookie
-                                    .store(result.session_cookie as u16, Ordering::SeqCst);
-
-                                tracing::info!(
-                                    "Session established: id={}, cookie={}",
-                                    result.session_id,
-                                    result.session_cookie
-                                );
-
-                                // Store negotiated compression types if returned
-                                // (The server may override client preferences)
-
-                                return Ok(());
+                            match parse_session_accept(state, &data, &init_token) {
+                                Ok(()) => return Ok(()),
+                                Err(e) => {
+                                    tracing::error!("Session parse error: {}", e);
+                                }
                             }
-                            // Fallback: use header fields directly
-                            state
-                                .session_id
-                                .store(h.session_id as u16, Ordering::SeqCst);
-                            let cookie = if !data.is_empty() {
-                                data[data.len() - 1]
-                            } else {
-                                h.session_cookie
-                            };
-                            state.session_cookie.store(cookie as u16, Ordering::SeqCst);
-                            return Ok(());
                         }
                     }
                 }
             }
-            Ok(Err(e)) => tracing::debug!("Session init recv error: {}", e),
-            Err(_) => tracing::debug!("Session init attempt {} timed out", attempt + 1),
+
+            if inner_attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        tracing::warn!(
+            "Session init failed via {} for {}. Retrying overall process...",
+            resolver_label,
+            domain
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    Err("Failed to initialize session with the server.".into())
+}
+
+// ---------------------------------------------------------------------------
+// Parse SESSION_ACCEPT response (mirrors Python _init_session parsing exactly)
+// ---------------------------------------------------------------------------
+fn parse_session_accept(
+    state: &ClientState,
+    returned_data: &[u8],
+    init_token: &str,
+) -> Result<(), String> {
+    if returned_data.is_empty() {
+        return Err("Empty response data".into());
+    }
+
+    // Python: parts = bytes(returned_data).split(b":", 2)
+    let parts: Vec<&[u8]> = returned_data.splitn(3, |&b| b == b':').collect();
+    if parts.len() < 2 {
+        return Err("Invalid response format: less than 2 parts".into());
+    }
+
+    // Python: received_token = parts[0].decode("ascii")
+    let received_token = std::str::from_utf8(parts[0])
+        .map_err(|e| format!("Token decode error: {}", e))?;
+
+    if received_token != init_token {
+        tracing::warn!("Token mismatch! Ignoring old session response.");
+        return Err("Token mismatch".into());
+    }
+
+    // Python: raw_sid = bytes(parts[1])
+    let raw_sid = parts[1];
+
+    let mut compression_pref: u8 = 0;
+    let mut session_cookie: u8 = 0;
+
+    if parts.len() >= 3 {
+        let raw_comp = parts[2];
+        if !raw_comp.is_empty() {
+            compression_pref = raw_comp[0];
+            if raw_comp.len() >= 2 {
+                session_cookie = raw_comp[1];
+            }
         }
     }
 
-    Err("Session init timed out after 10 attempts".into())
-}
-
-// ---------------------------------------------------------------------------
-// Parse SESSION_ACCEPT response payload
-// ---------------------------------------------------------------------------
-
-struct SessionAcceptResult {
-    session_id: u8,
-    session_cookie: u8,
-}
-
-fn parse_session_accept_response(
-    data: &[u8],
-    expected_token: &[u8],
-) -> Option<SessionAcceptResult> {
-    // Response format: token + ":" + session_id_str + ":" + comp_pref_byte + cookie_byte
-    let decrypted = data;
-    if decrypted.is_empty() {
-        return None;
+    // Negotiate upload compression
+    let new_upload = normalize_compression_type((compression_pref >> 4) & 0x0F);
+    if new_upload != state.upload_compression {
+        tracing::warn!(
+            "Server requested upload compression change. New Upload Compression: {}",
+            get_compression_name(new_upload)
+        );
     }
 
-    // Find first ":"
-    let first_colon = decrypted.iter().position(|&b| b == b':')?;
-    let token = &decrypted[..first_colon];
-
-    if token != expected_token {
-        return None;
+    // Negotiate download compression
+    let new_download = normalize_compression_type(compression_pref & 0x0F);
+    if new_download != state.download_compression {
+        tracing::warn!(
+            "Server requested download compression change. New Download Compression: {}",
+            get_compression_name(new_download)
+        );
     }
 
-    let rest = &decrypted[first_colon + 1..];
-    // Find second ":"
-    let second_colon = rest.iter().position(|&b| b == b':')?;
-    let session_id_str = std::str::from_utf8(&rest[..second_colon]).ok()?;
-    let session_id: u8 = session_id_str.parse().ok()?;
+    // Parse session ID
+    let sid_txt = std::str::from_utf8(raw_sid)
+        .unwrap_or("")
+        .trim()
+        .trim_matches('\x00');
 
-    let after_second = &rest[second_colon + 1..];
-    if after_second.len() < 2 {
-        return None;
-    }
+    let session_id: u8 = if let Ok(id) = sid_txt.parse::<u8>() {
+        id
+    } else if raw_sid.len() == 1 {
+        raw_sid[0]
+    } else {
+        return Err(format!("Invalid session id payload: {:?}", raw_sid));
+    };
 
-    // comp_pref_byte (ignored for now) and cookie_byte
-    let session_cookie = after_second[after_second.len() - 1];
+    state
+        .session_id
+        .store(session_id as u16, Ordering::SeqCst);
+    state
+        .session_cookie
+        .store(session_cookie as u16, Ordering::SeqCst);
 
-    Some(SessionAcceptResult {
+    tracing::info!(
+        "Validated Session ID: {}, Upload Compression: {}, Download Compression: {}",
         session_id,
-        session_cookie,
-    })
+        get_compression_name(new_upload),
+        get_compression_name(new_download)
+    );
+
+    Ok(())
+}
+
+/// Check if a received session cookie is valid for this packet type.
+/// Pre-session packet types (SESSION_ACCEPT, MTU_*, ERROR_DROP) expect cookie=0.
+pub fn _should_emit_invalid_cookie_error(
+    _received: u8,
+) -> bool {
+    false
 }

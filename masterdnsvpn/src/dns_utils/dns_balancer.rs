@@ -120,6 +120,24 @@ impl DNSBalancer {
         self.server_stats.remove(server_key);
     }
 
+    /// Update which servers are considered valid by providing a list of valid keys.
+    /// Only resolvers whose key is in valid_keys will be placed in valid_servers.
+    pub fn set_valid_servers(&mut self, valid_keys: &[String]) {
+        let key_set: std::collections::HashSet<&str> =
+            valid_keys.iter().map(|s| s.as_str()).collect();
+        self.valid_servers = self
+            .resolvers
+            .iter()
+            .filter(|r| key_set.contains(r.key.as_str()))
+            .cloned()
+            .collect();
+        // Also update the is_valid flag on the resolver entries
+        for r in &mut self.resolvers {
+            r.is_valid = key_set.contains(r.key.as_str());
+        }
+        self.rr_index = 0;
+    }
+
     pub fn get_loss_rate(&self, server_key: &str) -> f64 {
         match self.server_stats.get(server_key) {
             Some(stats) => {

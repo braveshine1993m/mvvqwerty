@@ -36,5 +36,6 @@ parking_lot = { workspace = true }
 chrono = { workspace = true }
 ctrlc = { workspace = true }
 hex = { workspace = true }
+num_cpus = { workspace = true }
 libc = { workspace = true }
 windows-sys = { workspace = true }

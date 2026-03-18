@@ -74,6 +74,14 @@ pub async fn create_connection_map(state: &Arc<ClientState>) {
                 domain: info.domain.clone(),
                 resolver: info.resolver.clone(),
                 resolver_addr: addr,
+                is_valid: false,
+                upload_mtu_bytes: 0,
+                upload_mtu_chars: 0,
+                download_mtu_bytes: 0,
+                packet_loss: 100,
+                recheck_fail_count: 0,
+                recheck_next_at: 0.0,
+                was_valid_once: false,
             });
         }
     }

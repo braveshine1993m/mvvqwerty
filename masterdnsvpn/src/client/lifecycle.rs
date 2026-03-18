@@ -40,9 +40,6 @@ use super::tx;
 // ---------------------------------------------------------------------------
 
 pub async fn run() {
-    println!("MasterDnsVPN Client v{}", config::BUILD_VERSION);
-    println!("Loading configuration...");
-
     let cfg = load_config(config::DEFAULT_CONFIG_FILE);
     if cfg.is_empty() {
         eprintln!(
@@ -58,68 +55,181 @@ pub async fn run() {
 
     let state = build_client_state(&cfg);
 
-    // Handle Ctrl+C
+    // Handle Ctrl+C (mirrors Python _signal_handler)
     let state_ctrlc = state.clone();
     ctrlc::set_handler(move || {
-        tracing::info!("Shutting down...");
+        if !state_ctrlc.running.load(Ordering::Relaxed) {
+            tracing::warn!("Force quitting immediately due to repeated signal.");
+            std::process::exit(0);
+        }
+        tracing::warn!("Stopping operations... (Press CTRL+C again to force quit)");
         state_ctrlc.running.store(false, Ordering::SeqCst);
-        std::process::exit(0);
+        state_ctrlc.session_restart.store(true, Ordering::SeqCst);
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Main reconnect loop
+    // --- Welcome Banner (mirrors Python start()) ---
+    tracing::info!("{}", "=".repeat(60));
+    tracing::info!("Starting MasterDnsVPN Client...");
+    tracing::info!("Build Version: {}", config::BUILD_VERSION);
+    tracing::info!("GitHub: https://github.com/masterking32/MasterDnsVPN");
+    tracing::info!("Telegram: @MasterDnsVPN");
+    tracing::info!("{}", "=".repeat(60));
+
+    if state.domains.is_empty() {
+        tracing::error!("Domains or Resolvers are missing in config.");
+        return;
+    }
+
+    // --- Main reconnect loop (mirrors Python start() while loop) ---
+    state.success_mtu_checks.store(false, Ordering::SeqCst);
+
     while state.running.load(Ordering::Relaxed) {
+        tracing::info!("{}", "=".repeat(60));
         state.session_restart.store(false, Ordering::SeqCst);
         state.session_established.store(false, Ordering::SeqCst);
+        state.session_id.store(0, Ordering::SeqCst);
 
-        // Bind UDP tunnel socket
-        let tunnel_sock = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                tracing::error!("Failed to bind tunnel UDP socket: {}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
+        // --- run_client() logic ---
+        tracing::info!("Setting up connections...");
+
+        if !state.success_mtu_checks.load(Ordering::Relaxed) {
+            // Build connection map
+            connection::create_connection_map(&state).await;
+            let all_resolvers = {
+                let conn_map = state.connection_map.lock().await;
+                conn_map.len()
+            };
+
+            // MTU testing for all connections
+            match mtu::test_mtu_sizes(&state).await {
+                Some(_r) => {},
+                None => {
+                    tracing::error!("No valid servers found to connect.");
+                    break;
+                }
+            };
+
+            // Collect valid connections and compute synced MTU
+            let (valid_conns, synced_up_mtu, synced_up_chars, synced_down_mtu) = {
+                let conn_map = state.connection_map.lock().await;
+                let valid: Vec<_> = conn_map.iter().filter(|c| c.is_valid).cloned().collect();
+                if valid.is_empty() {
+                    tracing::error!("No valid connections found after MTU testing!");
+                    break;
+                }
+                let min_up = valid.iter().map(|c| c.upload_mtu_bytes).min().unwrap_or(0);
+                let min_up_chars = valid.iter().map(|c| c.upload_mtu_chars).min().unwrap_or(0);
+                let min_down = valid.iter().map(|c| c.download_mtu_bytes).min().unwrap_or(0);
+                (valid, min_up, min_up_chars, min_down)
+            };
+
+            // Update balancer with valid connections
+            {
+                let mut bal = state.balancer.lock().await;
+                let valid_keys: Vec<String> = valid_conns.iter().map(|c| c.key.clone()).collect();
+                bal.set_valid_servers(&valid_keys);
             }
-        };
-        *state.tunnel_sock.lock().await = Some(tunnel_sock.clone());
 
-        // Build connection map
-        connection::create_connection_map(&state).await;
+            // Store synced MTU values
+            state.upload_mtu_bytes.store(synced_up_mtu, Ordering::SeqCst);
+            state.upload_mtu_chars.store(synced_up_chars, Ordering::SeqCst);
+            state.synced_upload_mtu_chars.store(synced_up_chars, Ordering::SeqCst);
+            state.download_mtu_bytes.store(synced_down_mtu, Ordering::SeqCst);
 
-        // Session init
-        match session::init_session(&state, &tunnel_sock).await {
+            let safe_uplink = synced_up_mtu.saturating_sub(state.crypto_overhead).max(64);
+            state.safe_uplink_mtu.store(safe_uplink, Ordering::SeqCst);
+
+            let max_up = valid_conns.iter().map(|c| c.upload_mtu_bytes).max().unwrap_or(0);
+            let max_down = valid_conns.iter().map(|c| c.download_mtu_bytes).max().unwrap_or(0);
+
+            // --- MTU results table (mirrors Python run_client logging) ---
+            tracing::info!("MTU Testing Completed!");
+            tracing::info!("{}", "=".repeat(80));
+            tracing::info!("Valid Connections After MTU Testing:");
+            tracing::info!("{}", "=".repeat(80));
+            tracing::info!(
+                "{:<20} {:<15} {:<15} {:<30}",
+                "Resolver", "Upload MTU", "Download MTU", "Domain"
+            );
+            tracing::info!("{}", "-".repeat(80));
+            for conn in &valid_conns {
+                tracing::info!(
+                    "{:<20} {:<15} {:<15} {:<30}",
+                    conn.resolver, conn.upload_mtu_bytes, conn.download_mtu_bytes, conn.domain
+                );
+            }
+            tracing::info!("{}", "=".repeat(80));
+            tracing::info!(
+                "Total valid resolvers after MTU testing: {} of {}",
+                valid_conns.len(),
+                all_resolvers
+            );
+            tracing::info!(
+                "Note: Each packet will be sent {} times to improve reliability.",
+                state.packet_duplication_count
+            );
+            tracing::info!("{}", "=".repeat(80));
+            tracing::info!(
+                "[MTU RESULTS] Max Upload MTU found: {} | Max Download MTU found: {}",
+                max_up, max_down
+            );
+            tracing::info!(
+                "[MTU RESULTS] Selected Synced Upload MTU: {} | Selected Synced Download MTU: {}",
+                synced_up_mtu, synced_down_mtu
+            );
+            tracing::info!("{}", "=".repeat(80));
+            tracing::info!(
+                "Global MTU Configuration -> Upload: {}, Download: {}",
+                synced_up_mtu, synced_down_mtu
+            );
+
+            state.success_mtu_checks.store(true, Ordering::SeqCst);
+        }
+
+        // Get best server to confirm availability
+        {
+            let mut bal = state.balancer.lock().await;
+            if bal.get_best_server().is_none() {
+                tracing::error!("No active servers available from Balancer.");
+                break;
+            }
+        }
+
+        // Session init (mirrors Python _init_session)
+        let max_attempts = cfg.get_i64_or("MAX_CONNECTION_ATTEMPTS", 10) as u32;
+        match session::init_session(&state, max_attempts).await {
             Ok(()) => {
                 tracing::info!(
-                    "Session established (id={}, cookie={})",
-                    state.session_id.load(Ordering::Relaxed),
-                    state.session_cookie.load(Ordering::Relaxed)
+                    "Session Established! Session ID: {}",
+                    state.session_id.load(Ordering::Relaxed)
                 );
                 state.session_established.store(true, Ordering::SeqCst);
             }
             Err(e) => {
-                tracing::error!("Session init failed: {}", e);
+                tracing::error!("Failed to initialize session with the server: {}", e);
+                if !state.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                tracing::warn!("Restarting Client workflow in 2 seconds...");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
             }
         }
 
-        // Sync MTU with server
-        if let Err(e) = mtu::sync_mtu_with_server(&state, &tunnel_sock).await {
-            tracing::warn!("MTU sync failed: {}", e);
+        // Sync MTU with server (mirrors Python _sync_mtu_with_server)
+        if let Err(e) = mtu::sync_mtu_with_server(&state).await {
+            tracing::error!("Failed to sync MTU with the server: {}", e);
+            if !state.running.load(Ordering::Relaxed) {
+                break;
+            }
+            tracing::warn!("Restarting Client workflow in 2 seconds...");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
         }
 
-        // Start TCP listener + workers
-        let bind_addr = format!("{}:{}", state.listen_ip, state.listen_port);
-        let listener = match TcpListener::bind(&bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to bind listener on {}: {}", bind_addr, e);
-                std::process::exit(1);
-            }
-        };
-        tracing::info!("Listening on {}", bind_addr);
-
-        run_tunnel_loop(&state, &tunnel_sock, listener).await;
+        // Enter tunnel main loop
+        run_tunnel_loop(&state).await;
 
         // Cleanup after disconnect
         stream::clear_runtime_state(&state).await;
@@ -127,7 +237,7 @@ pub async fn run() {
         if !state.running.load(Ordering::Relaxed) {
             break;
         }
-        tracing::warn!("Restarting client workflow in 2 seconds...");
+        tracing::warn!("Restarting Client workflow in 2 seconds...");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
@@ -181,6 +291,17 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
     let max_packed_blocks = cfg.get_i64_or("MAX_PACKETS_PER_BATCH", 100) as usize;
     let log_level = cfg.get_str_or("LOG_LEVEL", "INFO");
 
+    let min_upload_mtu = cfg.get_i64_or("MIN_UPLOAD_MTU", 0) as usize;
+    let max_upload_mtu = cfg.get_i64_or("MAX_UPLOAD_MTU", 512) as usize;
+    let min_download_mtu = cfg.get_i64_or("MIN_DOWNLOAD_MTU", 0) as usize;
+    let max_download_mtu = cfg.get_i64_or("MAX_DOWNLOAD_MTU", 1200) as usize;
+    let mtu_test_retries = cfg.get_i64_or("MTU_TEST_RETRIES", 3) as usize;
+    let mtu_test_timeout = cfg.get_f64_or("MTU_TEST_TIMEOUT", 3.0);
+    let mtu_test_parallelism = cfg.get_i64_or("MTU_TEST_PARALLELISM", 5) as usize;
+    let base_encode_responses = cfg.get_bool_or("BASE_ENCODE_RESPONSES", false);
+    let crypto_overhead = cfg.get_i64_or("CRYPTO_OVERHEAD", 32) as usize;
+    let resolver_balancing_strategy = cfg.get_i64_or("RESOLVER_BALANCING_STRATEGY", 2) as u32;
+
     utils::init_logger(&log_level, None, 0, 0, false);
 
     tracing::info!("Protocol: {}", protocol_type);
@@ -201,7 +322,7 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
     }
     tracing::info!("Loaded {} resolver(s)", resolvers.len());
 
-    let strategy = BalancerStrategy::from(cfg.get_i64_or("RESOLVER_BALANCING_STRATEGY", 2));
+    let strategy = BalancerStrategy::from(resolver_balancing_strategy as i64);
     let balancer = DNSBalancer::new(resolvers, strategy);
 
     let arq_config = ArqConfig {
@@ -271,6 +392,21 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
         pre_session_packet_types: config::pre_session_packet_types(),
         server_send_counts: Mutex::new(HashMap::new()),
         disabled_servers: Mutex::new(HashMap::new()),
+        min_upload_mtu,
+        max_upload_mtu,
+        min_download_mtu,
+        max_download_mtu,
+        mtu_test_retries,
+        mtu_test_timeout,
+        mtu_test_parallelism,
+        base_encode_responses,
+        crypto_overhead,
+        recheck_batch_size: AtomicUsize::new(5),
+        recheck_inactive_interval_seconds: std::sync::atomic::AtomicU64::new(30),
+        recheck_server_interval_seconds: std::sync::atomic::AtomicU64::new(60),
+        config_version: 0,
+        min_config_version: 0,
+        resolver_balancing_strategy,
     })
 }
 
@@ -279,26 +415,87 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
 // (mirrors Python _run_tunnel_loop / start)
 // ---------------------------------------------------------------------------
 
-async fn run_tunnel_loop(
-    state: &Arc<ClientState>,
-    sock: &Arc<UdpSocket>,
-    listener: TcpListener,
-) {
+async fn run_tunnel_loop(state: &Arc<ClientState>) {
+    tracing::info!("Entering VPN Tunnel Main Loop...");
+
+    // Bind UDP tunnel socket (mirrors Python _main_tunnel_loop socket setup)
+    let tunnel_sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("Failed to bind tunnel UDP socket: {}", e);
+            return;
+        }
+    };
+
+    // Set socket buffer sizes
+    let buffer_size: usize = 8_388_608;
+    utils::set_socket_buffer_size(&tunnel_sock, buffer_size);
+
+    *state.tunnel_sock.lock().await = Some(tunnel_sock.clone());
+
+    // Bind TCP listener
+    let bind_addr = format!("{}:{}", state.listen_ip, state.listen_port);
+    let listener = match TcpListener::bind(&bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Failed to bind listener on {}: {}", bind_addr, e);
+            return;
+        }
+    };
+
+    // Log listener info
+    tracing::info!("Local listener sockets: {}", bind_addr);
+
+    // Protocol startup message (mirrors Python _main_tunnel_loop)
+    if state.protocol_type == "SOCKS5" {
+        if state.socks5_auth && !state.socks5_user.is_empty() && !state.socks5_pass.is_empty() {
+            tracing::info!(
+                "SOCKS5 Proxy started on {} with Authentication. Username: {}",
+                state.listen_port, state.socks5_user
+            );
+        } else {
+            tracing::info!(
+                "SOCKS5 Proxy started on {} without Authentication.",
+                state.listen_port
+            );
+        }
+    } else {
+        tracing::info!(
+            "TCP Proxy started on {} (Protocol: {})",
+            state.listen_port, state.protocol_type
+        );
+    }
+
+    let cpu_count = num_cpus::get();
+    let num_rx = state.num_rx_workers;
+    let num_tx = 4; // default
+    tracing::info!(
+        "Runtime CPU cores detected: {} | RX workers: {} | TX workers: {}",
+        cpu_count, num_rx, num_tx
+    );
+    tracing::info!("Build Version: {}", config::BUILD_VERSION);
+    tracing::info!("{}", "=".repeat(80));
+    tracing::info!("Join our Telegram channel: @MasterDNSVPN for support and updates!");
+    tracing::info!("{}", "=".repeat(80));
+    tracing::info!("GitHub: https://github.com/masterking32/MasterDnsVPN");
+    tracing::info!("{}", "=".repeat(80));
+
+    // Spawn all workers
     let mut tasks = Vec::new();
 
     // RX workers
-    for _ in 0..state.num_rx_workers {
+    for _ in 0..num_rx {
         let s = state.clone();
-        let sk = sock.clone();
+        let sk = tunnel_sock.clone();
         tasks.push(tokio::spawn(async move {
             rx::rx_worker(&s, &sk).await;
         }));
     }
 
-    // TX worker
-    {
+    // TX workers
+    for _ in 0..num_tx {
         let s = state.clone();
-        let sk = sock.clone();
+        let sk = tunnel_sock.clone();
         tasks.push(tokio::spawn(async move {
             tx::tx_worker(&s, &sk).await;
         }));
@@ -357,10 +554,34 @@ async fn run_tunnel_loop(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    // Cancel all background tasks
-    for t in tasks {
+    // Cleanup (mirrors Python _main_tunnel_loop finally block)
+    tracing::info!("Cleaning up tunnel resources...");
+    for t in &tasks {
         t.abort();
     }
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    // Close all active streams
+    let stream_ids: Vec<u16> = {
+        let streams = state.active_streams.lock().await;
+        streams.keys().cloned().collect()
+    };
+    let is_restart = state.session_restart.load(Ordering::Relaxed);
+    let close_reason = if is_restart {
+        "Client Restarting"
+    } else {
+        "Client App Closing"
+    };
+    for sid in stream_ids {
+        stream::close_stream(state, sid, close_reason, is_restart, false).await;
+    }
+
+    // Close tunnel socket
+    *state.tunnel_sock.lock().await = None;
+
+    tracing::info!("Cleaning up old connections before reconnecting...");
 }
 
 // ---------------------------------------------------------------------------

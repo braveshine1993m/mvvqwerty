@@ -81,6 +81,14 @@ pub struct ConnectionEntry {
     pub domain: String,
     pub resolver: String,
     pub resolver_addr: SocketAddr,
+    pub is_valid: bool,
+    pub upload_mtu_bytes: usize,
+    pub upload_mtu_chars: usize,
+    pub download_mtu_bytes: usize,
+    pub packet_loss: u32,
+    pub recheck_fail_count: u32,
+    pub recheck_next_at: f64,
+    pub was_valid_once: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +170,27 @@ pub struct ClientState {
     // Server health tracking per connection key
     pub server_send_counts: Mutex<HashMap<String, u64>>,
     pub disabled_servers: Mutex<HashMap<String, Instant>>,
+
+    // MTU testing config
+    pub min_upload_mtu: usize,
+    pub max_upload_mtu: usize,
+    pub min_download_mtu: usize,
+    pub max_download_mtu: usize,
+    pub mtu_test_retries: usize,
+    pub mtu_test_timeout: f64,
+    pub mtu_test_parallelism: usize,
+    pub base_encode_responses: bool,
+    pub crypto_overhead: usize,
+
+    // Scale profile
+    pub recheck_batch_size: AtomicUsize,
+    pub recheck_inactive_interval_seconds: std::sync::atomic::AtomicU64,
+    pub recheck_server_interval_seconds: std::sync::atomic::AtomicU64,
+
+    // Config reference (for recommendations)
+    pub config_version: u32,
+    pub min_config_version: u32,
+    pub resolver_balancing_strategy: u32,
 }
 
 impl ClientState {
