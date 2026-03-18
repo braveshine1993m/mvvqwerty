@@ -154,6 +154,9 @@ struct ArqInner {
     // Dup ACK throttle
     last_dup_ack_sn: Option<u16>,
     last_dup_ack_time: Instant,
+
+    // Writer for delivering received data to local TCP stream
+    writer: Option<OwnedWriteHalf>,
 }
 
 /// Automatic Repeat Request for reliable data transfer over DNS.
@@ -184,7 +187,7 @@ impl Arq {
         enqueue_tx_cb: EnqueueTxCb,
         enqueue_control_tx_cb: EnqueueControlTxCb,
         reader: OwnedReadHalf,
-        _writer: OwnedWriteHalf,
+        writer: OwnedWriteHalf,
         mtu: usize,
         config: ArqConfig,
         initial_data: Vec<u8>,
@@ -227,6 +230,7 @@ impl Arq {
             stop_local_read: false,
             last_dup_ack_sn: None,
             last_dup_ack_time: now,
+            writer: Some(writer),
         }));
 
         let window_not_full = Arc::new(Notify::new());
@@ -785,9 +789,9 @@ impl Arq {
         inner.control_snd_buf.clear();
     }
 
-    /// Handle inbound STREAM_DATA without requiring an external writer reference.
-    /// The data is buffered in rcv_buf and the ARQ's internal io_loop delivers it
-    /// to the writer it already owns. An ACK is sent back immediately.
+    /// Handle inbound STREAM_DATA using the ARQ-owned writer.
+    /// Buffers data in rcv_buf, delivers in-order data to the local TCP stream,
+    /// and sends an ACK back immediately.
     pub async fn receive_data_only(&self, sn: u16, data: Vec<u8>) {
         let inner_guard = self.inner.lock().await;
         if inner_guard.closed || inner_guard.state == StreamState::Reset
@@ -829,13 +833,84 @@ impl Arq {
             }
 
             inner.rcv_buf.entry(sn).or_insert(data);
+
+            // Deliver in-order data to local TCP writer
+            let mut data_to_write = Vec::new();
+            loop {
+                let nxt = inner.rcv_nxt;
+                if let Some(d) = inner.rcv_buf.remove(&nxt) {
+                    data_to_write.push(d);
+                    inner.rcv_nxt = nxt.wrapping_add(1);
+                } else {
+                    break;
+                }
+            }
+
+            if !data_to_write.is_empty() {
+                if let Some(ref mut writer) = inner.writer {
+                    let combined: Vec<u8> = data_to_write.into_iter().flatten().collect();
+                    if let Err(e) = writer.write_all(&combined).await {
+                        tracing::debug!("Stream {} writer error: {}", self.stream_id, e);
+                        drop(inner);
+                        self.abort(&format!("Writer Error: {}", e), true).await;
+                        return;
+                    }
+                }
+            }
         }
 
         (self.enqueue_tx)(0, self.stream_id, sn, Vec::new(), true, false).await;
+
+        // Try finalize remote EOF
+        self.try_finalize_remote_eof_internal().await;
+    }
+
+    /// Write raw bytes to the local TCP stream (e.g. SOCKS5 success reply).
+    /// Must be called before notify_socks_connected() to avoid races.
+    pub async fn write_to_local(&self, data: &[u8]) -> Result<(), String> {
+        let mut inner = self.inner.lock().await;
+        if let Some(ref mut writer) = inner.writer {
+            writer
+                .write_all(data)
+                .await
+                .map_err(|e| format!("write_to_local error: {}", e))
+        } else {
+            Err("No writer available".to_string())
+        }
     }
 
     pub fn notify_socks_connected(&self) {
         self.socks_connected.notify_one();
+    }
+
+    /// Internal version of try_finalize_remote_eof using the ARQ-owned writer.
+    async fn try_finalize_remote_eof_internal(&self) {
+        let mut inner = self.inner.lock().await;
+        if inner.closed || inner.remote_write_closed || !inner.fin_received {
+            return;
+        }
+        if let Some(fin_seq) = inner.fin_seq_received {
+            if inner.rcv_nxt != fin_seq {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        inner.remote_write_closed = true;
+        let fin_seq = inner.fin_seq_received.unwrap();
+        drop(inner);
+
+        // Send FIN_ACK
+        self.send_control_packet(
+            PacketType::STREAM_FIN_ACK, fin_seq, &[], 0, false, None,
+        ).await;
+
+        let inner = self.inner.lock().await;
+        if inner.fin_sent && inner.fin_acked && inner.snd_buf.is_empty() {
+            drop(inner);
+            self.close("Both FIN sides fully acknowledged", false).await;
+        }
     }
 
     // -------------------------------------------------------------------------

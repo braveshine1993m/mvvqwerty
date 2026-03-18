@@ -430,8 +430,20 @@ pub async fn config_recommendations(state: &Arc<ClientState>) {
             "Waiting {} seconds so you can read the warnings above...",
             wait_time
         );
-        tracing::info!("Press CTRL+C to stop and fix your configuration!");
-        tokio::time::sleep(std::time::Duration::from_secs(wait_time as u64)).await;
+        tracing::info!("Press ENTER key to skip the wait and start immediately...");
+        tracing::info!("Or press CTRL+C to stop and fix your configuration!");
+
+        // Race: stdin readline vs timeout (mirrors Python's asyncio.wait_for + run_in_executor)
+        let timeout_fut = tokio::time::sleep(std::time::Duration::from_secs(wait_time as u64));
+        let stdin_fut = tokio::task::spawn_blocking(|| {
+            let mut buf = String::new();
+            let _ = std::io::stdin().read_line(&mut buf);
+        });
+
+        tokio::select! {
+            _ = timeout_fut => {}
+            _ = stdin_fut => {}
+        }
     } else {
         tracing::info!("Your configuration looks great! No critical warnings found.");
     }

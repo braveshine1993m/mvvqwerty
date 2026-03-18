@@ -676,16 +676,6 @@ async fn handle_client_connection(
     mut tcp_stream: TcpStream,
     addr: std::net::SocketAddr,
 ) {
-    tracing::debug!("New connection from {}", addr);
-
-    let stream_id = match stream::allocate_stream_id(&state).await {
-        Some(id) => id,
-        None => {
-            tracing::warn!("Stream ID exhausted, rejecting connection from {}", addr);
-            return;
-        }
-    };
-
     let is_socks5 = state.protocol_type == "SOCKS5";
     let mut socks5_result = None;
 
@@ -701,7 +691,16 @@ async fn handle_client_connection(
         }
     }
 
-    let _now = Instant::now();
+    let stream_id = match stream::allocate_stream_id(&state).await {
+        Some(id) => id,
+        None => {
+            tracing::warn!("Stream ID exhausted, rejecting connection from {}", addr);
+            return;
+        }
+    };
+
+    tracing::info!("New local connection, assigning Stream ID: {}", stream_id);
+
     let handshake_event = Arc::new(Notify::new());
 
     // Create the stream data
@@ -712,21 +711,61 @@ async fn handle_client_connection(
         sd.initial_payload = result.target_payload.clone();
     }
 
-    {
-        let mut streams = state.active_streams.lock().await;
-        streams.insert(stream_id, sd);
-    }
-
     if is_socks5 {
-        // Send SOCKS5_SYN with target payload
+        // ---------------------------------------------------------------
+        // SOCKS5 path (mirrors Python _stream_syn_handler)
+        // Create ARQ *before* sending SYN so the SYN goes via ARQ control
+        // reliability with retransmit tracking.
+        // ---------------------------------------------------------------
+        sd.status = "ACTIVE".to_string();
+
+        {
+            let mut streams = state.active_streams.lock().await;
+            streams.insert(stream_id, sd);
+        }
+
+        // Assign preferred server connection for sticky routing
+        connection::ensure_stream_preferred_connection(&state, stream_id).await;
+
+        // Split TCP and create ARQ stream immediately (mirrors Python _stream_syn_handler)
+        let (reader, writer) = tcp_stream.into_split();
+        let arq = stream::create_client_arq_stream(
+            &state,
+            stream_id,
+            reader,
+            writer,
+            vec![], // initial_data is empty; payload goes via SYN
+            true,   // is_socks: ARQ read loop waits for socks_connected
+        );
+
+        // Store ARQ in stream data
+        {
+            let mut streams = state.active_streams.lock().await;
+            if let Some(sd) = streams.get_mut(&stream_id) {
+                sd.arq = Some(arq.clone());
+            }
+        }
+
+        // Send SOCKS5_SYN via ARQ control reliability (with retransmit tracking)
         let target_payload = socks5_result
             .as_ref()
             .map(|r| r.target_payload.clone())
             .unwrap_or_default();
 
-        queue::enqueue_packet(&state, 0, stream_id, 0, PacketType::SOCKS5_SYN, target_payload)
-            .await;
-        queue::send_ping_packet(&state);
+        arq.send_control_packet(
+            PacketType::SOCKS5_SYN,
+            0,
+            &target_payload,
+            0,
+            true,
+            Some(PacketType::SOCKS5_SYN_ACK),
+        )
+        .await;
+
+        tracing::debug!(
+            "SOCKS5 Stream {} created and queued SOCKS5_SYN chunks.",
+            stream_id
+        );
 
         // Wait for server response (SYN_ACK or error)
         let timeout = std::time::Duration::from_secs_f64(state.socks_handshake_timeout);
@@ -736,68 +775,91 @@ async fn handle_client_connection(
                 let sd_check = match streams.get(&stream_id) {
                     Some(s) => s,
                     None => {
-                        let _ = tcp_stream
-                            .write_all(&socks5::build_socks5_fail_reply(
-                                &state.socks5_error_reply_map,
-                                PacketType::SOCKS5_CONNECT_FAIL,
-                            ))
-                            .await;
+                        tracing::debug!("Stream {} closed before handshake completion", stream_id);
                         return;
                     }
                 };
 
                 if let Some(err_ptype) = sd_check.socks_error_packet {
                     drop(streams);
-                    let _ = tcp_stream
-                        .write_all(&socks5::build_socks5_fail_reply(
-                            &state.socks5_error_reply_map,
-                            err_ptype,
-                        ))
-                        .await;
+                    tracing::debug!("SOCKS target rejected by server: ptype={}", err_ptype);
+                    let fail_reply = socks5::build_socks5_fail_reply(
+                        &state.socks5_error_reply_map,
+                        err_ptype,
+                    );
+                    let _ = arq.write_to_local(&fail_reply).await;
+                    arq.abort("SOCKS handshake failed", true).await;
                     stream::close_stream(&state, stream_id, "SOCKS5 error", true, false).await;
                     return;
                 }
 
                 if sd_check.status != "ACTIVE" {
                     drop(streams);
-                    let _ = tcp_stream
-                        .write_all(&socks5::build_socks5_fail_reply(
-                            &state.socks5_error_reply_map,
-                            PacketType::SOCKS5_CONNECT_FAIL,
-                        ))
-                        .await;
+                    let fail_reply = socks5::build_socks5_fail_reply(
+                        &state.socks5_error_reply_map,
+                        PacketType::SOCKS5_CONNECT_FAIL,
+                    );
+                    let _ = arq.write_to_local(&fail_reply).await;
+                    arq.abort("Stream not active", true).await;
                     stream::close_stream(&state, stream_id, "Stream not active", true, false)
                         .await;
                     return;
                 }
                 drop(streams);
 
-                // Send SOCKS5 success reply
+                // Send SOCKS5 success reply to local app via ARQ-owned writer
                 if let Some(ref result) = socks5_result {
                     let reply = socks5::build_socks5_success_reply(
                         result.atyp,
                         &result.target_addr_bytes,
                         &result.target_port_bytes,
                     );
-                    let _ = tcp_stream.write_all(&reply).await;
-                } else {
-                    let _ = tcp_stream
-                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    if let Err(e) = arq.write_to_local(&reply).await {
+                        tracing::debug!("Failed to write SOCKS5 reply: {}", e);
+                        arq.abort("Failed to write SOCKS5 reply", true).await;
+                        stream::close_stream(
+                            &state,
+                            stream_id,
+                            "Local app closed before SOCKS5 reply",
+                            true,
+                            false,
+                        )
                         .await;
+                        return;
+                    }
                 }
+
+                // Notify ARQ that SOCKS5 connection is established
+                // (unblocks the ARQ read loop to start forwarding data)
+                arq.notify_socks_connected();
             }
             Err(_) => {
-                tracing::debug!("SOCKS5 handshake timed out for stream {}", stream_id);
-                let _ = tcp_stream
-                    .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                tracing::debug!(
+                    "SOCKS handshake timed out for stream {} after {:.1}s",
+                    stream_id,
+                    state.socks_handshake_timeout
+                );
+                let fail_reply = socks5::build_socks5_fail_reply(
+                    &state.socks5_error_reply_map,
+                    PacketType::SOCKS5_UPSTREAM_UNAVAILABLE,
+                );
+                let _ = arq.write_to_local(&fail_reply).await;
+                arq.abort("SOCKS handshake timeout", true).await;
                 stream::close_stream(&state, stream_id, "SOCKS5 handshake timeout", true, false)
                     .await;
                 return;
             }
         }
     } else {
-        // Non-SOCKS5: send STREAM_SYN and wait
+        // ---------------------------------------------------------------
+        // Non-SOCKS5 (TCP forward): send STREAM_SYN and wait for SYN_ACK,
+        // then create ARQ after handshake completes.
+        // ---------------------------------------------------------------
+        {
+            let mut streams = state.active_streams.lock().await;
+            streams.insert(stream_id, sd);
+        }
+
         queue::enqueue_packet(&state, 0, stream_id, 0, PacketType::STREAM_SYN, vec![]).await;
 
         let timeout = std::time::Duration::from_secs_f64(state.socks_handshake_timeout);
@@ -826,10 +888,10 @@ async fn handle_client_connection(
                 return;
             }
         }
-    }
 
-    // Setup ARQ stream on the TCP connection
-    setup_arq_stream(state, tcp_stream, stream_id).await;
+        // Setup ARQ stream on the TCP connection (non-SOCKS5 path)
+        setup_arq_stream(state, tcp_stream, stream_id).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,12 +909,7 @@ async fn setup_arq_stream(state: Arc<ClientState>, tcp_stream: TcpStream, stream
             .unwrap_or_default()
     };
 
-    let arq = stream::create_client_arq_stream(&state, stream_id, reader, writer, initial_data);
-
-    // Notify socks connected if in SOCKS5 mode
-    if state.protocol_type == "SOCKS5" {
-        arq.notify_socks_connected();
-    }
+    let arq = stream::create_client_arq_stream(&state, stream_id, reader, writer, initial_data, false);
 
     // Store ARQ in stream data
     let mut streams = state.active_streams.lock().await;

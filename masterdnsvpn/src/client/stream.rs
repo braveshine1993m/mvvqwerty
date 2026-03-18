@@ -64,6 +64,7 @@ pub fn create_client_arq_stream(
     reader: tokio::net::tcp::OwnedReadHalf,
     writer: tokio::net::tcp::OwnedWriteHalf,
     initial_data: Vec<u8>,
+    is_socks: bool,
 ) -> Arc<Arq> {
     let session_id = state.session_id.load(Ordering::Relaxed) as u8;
 
@@ -90,6 +91,9 @@ pub fn create_client_arq_stream(
         },
     );
 
+    let mut arq_config = state.arq_config.clone();
+    arq_config.is_socks = is_socks;
+
     Arq::new(
         stream_id,
         session_id,
@@ -98,7 +102,7 @@ pub fn create_client_arq_stream(
         reader,
         writer,
         state.safe_uplink_mtu.load(Ordering::Relaxed),
-        state.arq_config.clone(),
+        arq_config,
         initial_data,
     )
 }
