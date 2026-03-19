@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::net::tcp::OwnedWriteHalf;
+
 use crate::dns_utils::arq::Arq;
 use crate::dns_utils::dns_enums::PacketType;
 use crate::dns_utils::packet_queue::{PacketQueueManager, QueueOwner};
@@ -58,14 +60,19 @@ pub async fn allocate_stream_id(state: &Arc<ClientState>) -> Option<u16> {
 
 /// Create an ARQ instance wired to the client's enqueue callbacks,
 /// attach it to a TCP stream's read/write halves, and return it.
+/// Returns `(arq, writer_opt)`.
+/// - For SOCKS5 (`is_socks=true`): writer is returned as `Some(writer)` so the caller
+///   can write the SOCKS5 success reply directly, then call `arq.set_writer(writer)`
+///   followed by `arq.notify_socks_connected()`.
+/// - For non-SOCKS: writer is passed straight into ARQ, returns `None`.
 pub fn create_client_arq_stream(
     state: &Arc<ClientState>,
     stream_id: u16,
     reader: tokio::net::tcp::OwnedReadHalf,
-    writer: tokio::net::tcp::OwnedWriteHalf,
+    writer: OwnedWriteHalf,
     initial_data: Vec<u8>,
     is_socks: bool,
-) -> Arc<Arq> {
+) -> (Arc<Arq>, Option<OwnedWriteHalf>) {
     let session_id = state.session_id.load(Ordering::Relaxed) as u8;
 
     let state_tx = state.clone();
@@ -94,17 +101,34 @@ pub fn create_client_arq_stream(
     let mut arq_config = state.arq_config.clone();
     arq_config.is_socks = is_socks;
 
-    Arq::new(
-        stream_id,
-        session_id,
-        enqueue_tx,
-        enqueue_ctrl,
-        reader,
-        writer,
-        state.safe_uplink_mtu.load(Ordering::Relaxed),
-        arq_config,
-        initial_data,
-    )
+    if is_socks {
+        // SOCKS5: pass None writer to ARQ — caller keeps writer for SOCKS5 reply
+        let arq = Arq::new(
+            stream_id,
+            session_id,
+            enqueue_tx,
+            enqueue_ctrl,
+            reader,
+            None, // writer provided later via arq.set_writer()
+            state.safe_uplink_mtu.load(Ordering::Relaxed),
+            arq_config,
+            initial_data,
+        );
+        (arq, Some(writer))
+    } else {
+        let arq = Arq::new(
+            stream_id,
+            session_id,
+            enqueue_tx,
+            enqueue_ctrl,
+            reader,
+            Some(writer),
+            state.safe_uplink_mtu.load(Ordering::Relaxed),
+            arq_config,
+            initial_data,
+        );
+        (arq, None)
+    }
 }
 
 // ---------------------------------------------------------------------------

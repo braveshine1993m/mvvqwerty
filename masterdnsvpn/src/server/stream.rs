@@ -213,7 +213,7 @@ pub fn create_server_arq_stream(
         enqueue_tx,
         enqueue_ctrl,
         reader,
-        writer,
+        Some(writer),
         mtu,
         state.arq_config.clone(),
         initial_data,

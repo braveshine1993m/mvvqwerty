@@ -9,8 +9,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, Mutex, Notify};
 
 use super::dns_enums::{PacketType, StreamState};
 
@@ -154,9 +153,6 @@ struct ArqInner {
     // Dup ACK throttle
     last_dup_ack_sn: Option<u16>,
     last_dup_ack_time: Instant,
-
-    // Writer for delivering received data to local TCP stream
-    writer: Option<OwnedWriteHalf>,
 }
 
 /// Automatic Repeat Request for reliable data transfer over DNS.
@@ -172,12 +168,13 @@ pub struct Arq {
     inner: Arc<Mutex<ArqInner>>,
     window_not_full: Arc<Notify>,
     socks_connected: Arc<Notify>,
+    /// Wakes the write delivery loop when new data is buffered in rcv_buf
+    rcv_notify: Arc<Notify>,
+    /// Sends the OwnedWriteHalf into the io_loop once ready (after SOCKS5 reply is written)
+    writer_tx: Mutex<Option<oneshot::Sender<OwnedWriteHalf>>>,
 
     control_ack_map: HashMap<u8, u8>,
     control_reverse_ack_map: HashMap<u8, u8>,
-
-    io_task: Option<JoinHandle<()>>,
-    rtx_task: Option<JoinHandle<()>>,
 }
 
 impl Arq {
@@ -187,7 +184,7 @@ impl Arq {
         enqueue_tx_cb: EnqueueTxCb,
         enqueue_control_tx_cb: EnqueueControlTxCb,
         reader: OwnedReadHalf,
-        writer: OwnedWriteHalf,
+        writer: Option<OwnedWriteHalf>,
         mtu: usize,
         config: ArqConfig,
         initial_data: Vec<u8>,
@@ -230,11 +227,12 @@ impl Arq {
             stop_local_read: false,
             last_dup_ack_sn: None,
             last_dup_ack_time: now,
-            writer: Some(writer),
         }));
 
         let window_not_full = Arc::new(Notify::new());
         let socks_connected = Arc::new(Notify::new());
+        let rcv_notify = Arc::new(Notify::new());
+        let (writer_tx, writer_rx) = oneshot::channel::<OwnedWriteHalf>();
 
         let mut effective_config = config.clone();
         effective_config.rto = rto;
@@ -260,14 +258,20 @@ impl Arq {
             inner,
             window_not_full,
             socks_connected: socks_connected.clone(),
+            rcv_notify: rcv_notify.clone(),
+            writer_tx: Mutex::new(Some(writer_tx)),
             control_ack_map: ack_map,
             control_reverse_ack_map: reverse_map,
-            io_task: None,
-            rtx_task: None,
         });
 
         if !arq.config.is_socks {
             arq.socks_connected.notify_one();
+        }
+        // Send writer into the delivery channel if provided
+        if let Some(w) = writer {
+            if let Some(tx) = arq.writer_tx.lock().await.take() {
+                let _ = tx.send(w);
+            }
         }
 
         // Spawn IO and retransmit tasks
@@ -275,7 +279,7 @@ impl Arq {
         let arq_rtx = arq.clone();
 
         let io_handle = tokio::spawn(async move {
-            arq_io.io_loop(reader, initial_data).await;
+            arq_io.io_loop(reader, writer_rx, initial_data).await;
         });
 
         let rtx_handle = tokio::spawn(async move {
@@ -305,8 +309,84 @@ impl Arq {
 
     // -------------------------------------------------------------------------
     // IO Loop - reads from local socket, enqueues reliable outbound packets
+    // Write delivery loop - writes rcv_buf data to local TCP writer
     // -------------------------------------------------------------------------
-    async fn io_loop(&self, mut reader: OwnedReadHalf, initial_data: Vec<u8>) {
+    async fn io_loop(
+        &self,
+        mut reader: OwnedReadHalf,
+        writer_rx: oneshot::Receiver<OwnedWriteHalf>,
+        initial_data: Vec<u8>,
+    ) {
+        // Spawn the write delivery loop — waits for writer, then delivers rcv_buf to local app
+        let inner_ref = self.inner.clone();
+        let enqueue_ctrl_ref = self.enqueue_control_tx.clone();
+        let rcv_notify_ref = self.rcv_notify.clone();
+        let stream_id = self.stream_id;
+        tokio::spawn(async move {
+            // Wait for writer to arrive (sent by caller after SOCKS5 reply or immediately for non-SOCKS)
+            let mut writer = match writer_rx.await {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            // Event-driven drain loop: wake on rcv_notify, deliver in-order rcv_buf to writer
+            loop {
+                // Wait for new data signal or closed
+                rcv_notify_ref.notified().await;
+
+                loop {
+                    let (chunks, fin_done) = {
+                        let mut inner = inner_ref.lock().await;
+                        if inner.closed {
+                            return;
+                        }
+                        let mut chunks = Vec::new();
+                        loop {
+                            let nxt = inner.rcv_nxt;
+                            if let Some(d) = inner.rcv_buf.remove(&nxt) {
+                                chunks.push(d);
+                                inner.rcv_nxt = nxt.wrapping_add(1);
+                            } else {
+                                break;
+                            }
+                        }
+                        // Check for remote FIN: all data delivered, FIN seq reached
+                        let fin_done = inner.fin_received
+                            && inner.fin_seq_received.map_or(false, |fs| inner.rcv_nxt == fs)
+                            && !inner.remote_write_closed;
+                        if fin_done {
+                            inner.remote_write_closed = true;
+                        }
+                        (chunks, fin_done)
+                    };
+
+                    if !chunks.is_empty() {
+                        let combined: Vec<u8> = chunks.into_iter().flatten().collect();
+                        if let Err(_) = writer.write_all(&combined).await {
+                            return;
+                        }
+                    }
+
+                    if fin_done {
+                        // Send FIN_ACK via control enqueue
+                        let fin_seq = {
+                            let inner = inner_ref.lock().await;
+                            inner.fin_seq_received.unwrap_or(0)
+                        };
+                        (enqueue_ctrl_ref)(0, stream_id, fin_seq, PacketType::STREAM_FIN_ACK, Vec::new(), false).await;
+                        return;
+                    }
+
+                    // No more in-order data available — break inner loop, wait for next notify
+                    let has_next = {
+                        let inner = inner_ref.lock().await;
+                        inner.rcv_buf.contains_key(&inner.rcv_nxt)
+                    };
+                    if !has_next {
+                        break;
+                    }
+                }
+            }
+        });
         let mut reset_required = false;
         let mut graceful_eof = false;
         let mut error_reason: Option<String> = None;
@@ -341,7 +421,7 @@ impl Arq {
             }
         }
 
-        // Wait for SOCKS connection
+        // Wait for SOCKS connection to be established before reading local data
         if self.config.is_socks {
             self.socks_connected.notified().await;
         }
@@ -525,79 +605,6 @@ impl Arq {
     // -------------------------------------------------------------------------
     // Data plane
     // -------------------------------------------------------------------------
-    /// Handle inbound STREAM_DATA and emit STREAM_DATA_ACK.
-    pub async fn receive_data(&self, sn: u16, data: Vec<u8>, writer: &mut OwnedWriteHalf) {
-        let inner_guard = self.inner.lock().await;
-        if inner_guard.closed || inner_guard.state == StreamState::Reset
-            || inner_guard.rst_received || inner_guard.rst_sent
-        {
-            return;
-        }
-        drop(inner_guard);
-
-        let sn = Self::norm_sn(sn);
-
-        {
-            let mut inner = self.inner.lock().await;
-            inner.last_activity = Instant::now();
-
-            let diff = sn.wrapping_sub(inner.rcv_nxt);
-            if diff >= 32768 {
-                // Dup ACK throttle
-                let now = Instant::now();
-                let rto = self.config.rto;
-                let ack_throttle = rto.min(0.3).max(0.05);
-                let should_ack = inner.last_dup_ack_sn != Some(sn)
-                    || now.duration_since(inner.last_dup_ack_time).as_secs_f64() >= ack_throttle;
-
-                if should_ack {
-                    inner.last_dup_ack_sn = Some(sn);
-                    inner.last_dup_ack_time = now;
-                    drop(inner);
-                    (self.enqueue_tx)(0, self.stream_id, sn, Vec::new(), true, false).await;
-                }
-                return;
-            }
-
-            if diff as usize > self.config.window_size {
-                return;
-            }
-
-            // Hard cap reordering buffer
-            if !inner.rcv_buf.contains_key(&sn) && inner.rcv_buf.len() >= self.config.window_size {
-                return;
-            }
-
-            inner.rcv_buf.entry(sn).or_insert(data);
-
-            // Deliver in-order data
-            let mut data_to_write = Vec::new();
-            loop {
-                let nxt = inner.rcv_nxt;
-                if let Some(d) = inner.rcv_buf.remove(&nxt) {
-                    data_to_write.push(d);
-                    inner.rcv_nxt = nxt.wrapping_add(1);
-                } else {
-                    break;
-                }
-            }
-            drop(inner);
-
-            if !data_to_write.is_empty() {
-                let combined: Vec<u8> = data_to_write.into_iter().flatten().collect();
-                if let Err(e) = writer.write_all(&combined).await {
-                    tracing::debug!("Stream {} writer error: {}", self.stream_id, e);
-                    self.abort(&format!("Writer Error: {}", e), true).await;
-                    return;
-                }
-            }
-        }
-
-        (self.enqueue_tx)(0, self.stream_id, sn, Vec::new(), true, false).await;
-
-        // Try finalize remote EOF
-        self.try_finalize_remote_eof(writer).await;
-    }
 
     /// Handle inbound STREAM_DATA_ACK.
     pub async fn receive_ack(&self, sn: u16) {
@@ -608,35 +615,6 @@ impl Arq {
             if inner.snd_buf.len() < self.limit {
                 self.window_not_full.notify_one();
             }
-        }
-    }
-
-    async fn try_finalize_remote_eof(&self, _writer: &mut OwnedWriteHalf) {
-        let mut inner = self.inner.lock().await;
-        if inner.closed || inner.remote_write_closed || !inner.fin_received {
-            return;
-        }
-        if let Some(fin_seq) = inner.fin_seq_received {
-            if inner.rcv_nxt != fin_seq {
-                return;
-            }
-        } else {
-            return;
-        }
-
-        inner.remote_write_closed = true;
-        let fin_seq = inner.fin_seq_received.unwrap();
-        drop(inner);
-
-        // Send FIN_ACK
-        self.send_control_packet(
-            PacketType::STREAM_FIN_ACK, fin_seq, &[], 0, false, None,
-        ).await;
-
-        let inner = self.inner.lock().await;
-        if inner.fin_sent && inner.fin_acked && inner.snd_buf.is_empty() {
-            drop(inner);
-            self.close("Both FIN sides fully acknowledged", false).await;
         }
     }
 
@@ -760,6 +738,9 @@ impl Arq {
         let mut inner = self.inner.lock().await;
         inner.fin_received = true;
         inner.fin_seq_received = Some(Self::norm_sn(seq_num));
+        drop(inner);
+        self.rcv_notify.notify_one();
+        let mut inner = self.inner.lock().await;
         inner.stop_local_read = true;
         if inner.fin_sent {
             inner.state = StreamState::Closing;
@@ -789,9 +770,8 @@ impl Arq {
         inner.control_snd_buf.clear();
     }
 
-    /// Handle inbound STREAM_DATA using the ARQ-owned writer.
-    /// Buffers data in rcv_buf, delivers in-order data to the local TCP stream,
-    /// and sends an ACK back immediately.
+    /// Handle inbound STREAM_DATA: buffer in rcv_buf; the write delivery loop
+    /// (spawned in io_loop) drains in-order chunks to the local TCP writer.
     pub async fn receive_data_only(&self, sn: u16, data: Vec<u8>) {
         let inner_guard = self.inner.lock().await;
         if inner_guard.closed || inner_guard.state == StreamState::Reset
@@ -814,7 +794,6 @@ impl Arq {
                 let ack_throttle = rto.min(0.3).max(0.05);
                 let should_ack = inner.last_dup_ack_sn != Some(sn)
                     || now.duration_since(inner.last_dup_ack_time).as_secs_f64() >= ack_throttle;
-
                 if should_ack {
                     inner.last_dup_ack_sn = Some(sn);
                     inner.last_dup_ack_time = now;
@@ -832,85 +811,26 @@ impl Arq {
                 return;
             }
 
+            // Buffer the packet; write delivery loop will drain in-order to writer
             inner.rcv_buf.entry(sn).or_insert(data);
-
-            // Deliver in-order data to local TCP writer
-            let mut data_to_write = Vec::new();
-            loop {
-                let nxt = inner.rcv_nxt;
-                if let Some(d) = inner.rcv_buf.remove(&nxt) {
-                    data_to_write.push(d);
-                    inner.rcv_nxt = nxt.wrapping_add(1);
-                } else {
-                    break;
-                }
-            }
-
-            if !data_to_write.is_empty() {
-                if let Some(ref mut writer) = inner.writer {
-                    let combined: Vec<u8> = data_to_write.into_iter().flatten().collect();
-                    if let Err(e) = writer.write_all(&combined).await {
-                        tracing::debug!("Stream {} writer error: {}", self.stream_id, e);
-                        drop(inner);
-                        self.abort(&format!("Writer Error: {}", e), true).await;
-                        return;
-                    }
-                }
-            }
         }
 
         (self.enqueue_tx)(0, self.stream_id, sn, Vec::new(), true, false).await;
-
-        // Try finalize remote EOF
-        self.try_finalize_remote_eof_internal().await;
+        // Wake the write delivery loop so it can drain newly buffered data
+        self.rcv_notify.notify_one();
     }
 
-    /// Write raw bytes to the local TCP stream (e.g. SOCKS5 success reply).
-    /// Must be called before notify_socks_connected() to avoid races.
-    pub async fn write_to_local(&self, data: &[u8]) -> Result<(), String> {
-        let mut inner = self.inner.lock().await;
-        if let Some(ref mut writer) = inner.writer {
-            writer
-                .write_all(data)
-                .await
-                .map_err(|e| format!("write_to_local error: {}", e))
-        } else {
-            Err("No writer available".to_string())
+    /// Hand the OwnedWriteHalf to the ARQ write delivery loop.
+    /// For SOCKS5: call this AFTER writing the success reply on the writer directly,
+    /// then call notify_socks_connected() to unblock the read loop.
+    pub async fn set_writer(&self, writer: OwnedWriteHalf) {
+        if let Some(tx) = self.writer_tx.lock().await.take() {
+            let _ = tx.send(writer);
         }
     }
 
     pub fn notify_socks_connected(&self) {
         self.socks_connected.notify_one();
-    }
-
-    /// Internal version of try_finalize_remote_eof using the ARQ-owned writer.
-    async fn try_finalize_remote_eof_internal(&self) {
-        let mut inner = self.inner.lock().await;
-        if inner.closed || inner.remote_write_closed || !inner.fin_received {
-            return;
-        }
-        if let Some(fin_seq) = inner.fin_seq_received {
-            if inner.rcv_nxt != fin_seq {
-                return;
-            }
-        } else {
-            return;
-        }
-
-        inner.remote_write_closed = true;
-        let fin_seq = inner.fin_seq_received.unwrap();
-        drop(inner);
-
-        // Send FIN_ACK
-        self.send_control_packet(
-            PacketType::STREAM_FIN_ACK, fin_seq, &[], 0, false, None,
-        ).await;
-
-        let inner = self.inner.lock().await;
-        if inner.fin_sent && inner.fin_acked && inner.snd_buf.is_empty() {
-            drop(inner);
-            self.close("Both FIN sides fully acknowledged", false).await;
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -1068,6 +988,9 @@ impl Arq {
         } else {
             self.finalize_close(&mut inner);
         }
+        // Wake blocked loops so they can detect closed state
+        self.rcv_notify.notify_one();
+        self.window_not_full.notify_one();
     }
 
     fn finalize_close(&self, inner: &mut ArqInner) {
