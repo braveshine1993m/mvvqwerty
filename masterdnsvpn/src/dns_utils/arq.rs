@@ -247,6 +247,16 @@ impl Arq {
         effective_config.control_max_retries = config.control_max_retries.max(5);
         effective_config.control_packet_ttl = config.control_packet_ttl.max(120.0);
 
+        // For non-SOCKS (writer is Some): send directly into the oneshot channel now,
+        // before constructing the Arc. The writer_tx stored in Arq is already consumed.
+        // For SOCKS5 (writer is None): writer_tx is kept so set_writer() can send later.
+        let initial_writer_tx = if let Some(w) = writer {
+            let _ = writer_tx.send(w);
+            None // already consumed
+        } else {
+            Some(writer_tx)
+        };
+
         let arq = Arc::new(Arq {
             stream_id,
             session_id,
@@ -259,19 +269,13 @@ impl Arq {
             window_not_full,
             socks_connected: socks_connected.clone(),
             rcv_notify: rcv_notify.clone(),
-            writer_tx: Mutex::new(Some(writer_tx)),
+            writer_tx: Mutex::new(initial_writer_tx),
             control_ack_map: ack_map,
             control_reverse_ack_map: reverse_map,
         });
 
         if !arq.config.is_socks {
             arq.socks_connected.notify_one();
-        }
-        // Send writer into the delivery channel if provided
-        if let Some(w) = writer {
-            if let Some(tx) = arq.writer_tx.lock().await.take() {
-                let _ = tx.send(w);
-            }
         }
 
         // Spawn IO and retransmit tasks
