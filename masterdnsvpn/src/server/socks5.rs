@@ -589,6 +589,14 @@ pub async fn handle_socks5_syn(
         // Check if we have all fragments
         if sd.socks_chunks.len() < total_frags as usize {
             // Send fragment ACK for this intermediate fragment (mirrors Python)
+            let fragment_payload = vec![
+                b'S',
+                b'F',
+                b'R',
+                frag_id,
+                total_frags,
+                sd.socks_chunks.len() as u8,
+            ];
             drop(sessions);
             queue::enqueue_packet(
                 state,
@@ -597,7 +605,7 @@ pub async fn handle_socks5_syn(
                 stream_id,
                 0,
                 PacketType::SOCKS5_SYN_ACK,
-                vec![],
+                fragment_payload,
             )
             .await;
             return;

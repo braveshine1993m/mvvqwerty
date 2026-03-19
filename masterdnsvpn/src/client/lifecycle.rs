@@ -771,6 +771,7 @@ async fn handle_client_connection(
             Some(PacketType::SOCKS5_SYN_ACK),
         )
         .await;
+        queue::send_ping_packet(&state);
 
         tracing::debug!(
             "SOCKS5 Stream {} created and queued SOCKS5_SYN chunks.",
