@@ -3,7 +3,7 @@
 // Github: https://github.com/masterking32
 // Year: 2026
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -17,30 +17,129 @@ use super::state::{ClientState, ConnectionEntry};
 // Resolver loading from config + file
 // ---------------------------------------------------------------------------
 
+/// Parse a resolver line into (ip_str, port).
+/// Accepts: "1.2.3.4", "1.2.3.4:5353"
+fn parse_resolver_entry(line: &str) -> Option<(String, u16)> {
+    if line.contains(':') {
+        // Could be ip:port
+        let parts: Vec<&str> = line.rsplitn(2, ':').collect();
+        if parts.len() == 2 {
+            if let Ok(port) = parts[0].parse::<u16>() {
+                let ip = parts[1].to_string();
+                // Validate it looks like an IP
+                if ip.parse::<std::net::IpAddr>().is_ok() {
+                    return Some((ip, port));
+                }
+            }
+        }
+        // Try as bare IPv6 (rare) — fall through
+        None
+    } else {
+        // bare IP, default port 53
+        if line.parse::<std::net::IpAddr>().is_ok() {
+            Some((line.to_string(), 53))
+        } else {
+            None
+        }
+    }
+}
+
+/// Expand CIDR notation to individual IPs (max 65536 hosts like Python).
+/// Returns None if not CIDR, or Err if too large.
+fn expand_cidr(line: &str) -> Option<Vec<String>> {
+    if !line.contains('/') {
+        return None;
+    }
+    // Parse as IPv4 CIDR only (common case)
+    let (cidr_part, port_opt) = if let Some(idx) = line.find(':') {
+        // cidr:port not standard, but handle gracefully
+        (&line[..idx], Some(&line[idx+1..]))
+    } else {
+        (line, None)
+    };
+    let _ = port_opt; // port from CIDR line not used; caller uses default 53
+    let network: std::net::Ipv4Addr;
+    let prefix_len: u8;
+    let parts: Vec<&str> = cidr_part.splitn(2, '/').collect();
+    if parts.len() != 2 { return None; }
+    network = parts[0].parse().ok()?;
+    prefix_len = parts[1].parse().ok()?;
+    if prefix_len > 32 { return None; }
+    let num_hosts = 1u64 << (32 - prefix_len);
+    if num_hosts > 65536 { return None; } // mirrors Python max_cidr_hosts
+    let base = u32::from(network);
+    let mask = if prefix_len == 0 { 0u32 } else { !((1u32 << (32 - prefix_len)) - 1) };
+    let network_addr = base & mask;
+    let broadcast = network_addr | ((1u32 << (32 - prefix_len)) - 1);
+    // usable hosts: skip network and broadcast for /0.../30
+    let (start, end) = if prefix_len < 31 {
+        (network_addr + 1, broadcast.saturating_sub(1))
+    } else {
+        (network_addr, broadcast)
+    };
+    let mut ips = Vec::new();
+    let mut ip = start;
+    while ip <= end {
+        ips.push(std::net::Ipv4Addr::from(ip).to_string());
+        if ip == u32::MAX { break; }
+        ip += 1;
+    }
+    Some(ips)
+}
+
 /// Load resolver addresses from the resolvers file specified in config.
-/// Falls back to public DNS (8.8.8.8, 1.1.1.1) if no resolvers are found.
+/// Deduplicates by (ip, port) like Python _load_resolvers_from_file.
+/// Supports CIDR ranges.
 pub fn load_resolvers(
     config: &HashMap<String, toml::Value>,
     domains: &[String],
 ) -> Vec<ResolverInfo> {
-    let mut resolvers = Vec::new();
+    let mut resolvers: Vec<ResolverInfo> = Vec::new();
+    let mut seen: HashSet<(String, u16)> = HashSet::new();
 
     let resolvers_file = config.get_str_or("CLIENT_RESOLVERS_FILE", "client_resolvers.txt");
     let file_path = get_config_path(&resolvers_file);
 
     if let Some(content) = utils::load_text(&file_path.to_string_lossy()) {
-        for line in content.lines() {
-            let line = line.trim();
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let resolver = if line.contains(':') {
-                line.to_string()
-            } else {
-                format!("{}:53", line)
-            };
-            for domain in domains {
-                resolvers.push(ResolverInfo::new(&resolver, domain, true));
+
+            // Try CIDR expansion first
+            if let Some(ips) = expand_cidr(line) {
+                let expanded = ips.len();
+                let mut count = 0usize;
+                for ip in ips {
+                    let entry = (ip.clone(), 53u16);
+                    if seen.contains(&entry) { continue; }
+                    seen.insert(entry);
+                    for domain in domains {
+                        resolvers.push(ResolverInfo::new(&format!("{}:53", ip), domain, true));
+                    }
+                    count += 1;
+                }
+                tracing::debug!("Expanded CIDR '{}' to {} IPs ({} new)", line, expanded, count);
+                continue;
+            }
+
+            // Parse single IP or IP:port
+            match parse_resolver_entry(line) {
+                Some((ip, port)) => {
+                    let entry = (ip.clone(), port);
+                    if seen.contains(&entry) {
+                        continue;
+                    }
+                    seen.insert(entry);
+                    let addr_str = format!("{}:{}", ip, port);
+                    for domain in domains {
+                        resolvers.push(ResolverInfo::new(&addr_str, domain, true));
+                    }
+                }
+                None => {
+                    tracing::warn!("Invalid resolver entry '{}' ignored.", line);
+                }
             }
         }
     }

@@ -5,6 +5,7 @@
 // Github: https://github.com/masterking32
 // Year: 2026
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -364,6 +365,85 @@ async fn test_download_mtu_size(
 }
 
 // ---------------------------------------------------------------------------
+// MTU success file helpers (mirrors Python _resolve_mtu_success_output_path,
+// _format_mtu_log_line, _append_mtu_success_line)
+// ---------------------------------------------------------------------------
+
+/// Resolve the output file path for MTU success results.
+/// Replaces `{time}` in the filename with a timestamp.
+/// Returns empty string if saving is disabled or filename is empty.
+fn resolve_mtu_output_path(state: &Arc<ClientState>) -> String {
+    if !state.save_mtu_servers_to_file {
+        return String::new();
+    }
+    let raw = state.mtu_servers_file_name.trim().to_string();
+    if raw.is_empty() {
+        tracing::warn!("MTU result saving is enabled, but MTU_SERVERS_FILE_NAME is empty.");
+        return String::new();
+    }
+    if raw.contains("{time}") {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let base = raw.replace("{time}", "").trim().to_string();
+        let base = if base.is_empty() {
+            "masterdnsvpn_success_test".to_string()
+        } else {
+            base
+        };
+        let (root, ext) = if let Some(pos) = base.rfind('.') {
+            (&base[..pos], &base[pos..])
+        } else {
+            (base.as_str(), "")
+        };
+        let ext = if ext.is_empty() { ".log" } else { ext };
+        format!("{}_{}{}", root, ts, ext)
+    } else {
+        raw
+    }
+}
+
+/// Format a single MTU log line from template (mirrors Python _format_mtu_log_line).
+/// Template variables: {IP}, {UP_MTU}, {DOWN-MTU}, {DOMAIN}
+fn format_mtu_line(template: &str, conn: &ConnectionEntry) -> String {
+    // Extract IP from resolver "ip:port"
+    let ip = conn.resolver
+        .rsplitn(2, ':')
+        .last()
+        .unwrap_or(&conn.resolver)
+        .to_string();
+    template
+        .replace("{IP}", &ip)
+        .replace("{UP_MTU}", &conn.upload_mtu_bytes.to_string())
+        .replace("{DOWN-MTU}", &conn.download_mtu_bytes.to_string())
+        .replace("{DOWN_MTU}", &conn.download_mtu_bytes.to_string())
+        .replace("{DOMAIN}", &conn.domain)
+        .replace("{RESOLVER}", &conn.resolver)
+}
+
+/// Append a success line to the MTU output file (mirrors Python _append_mtu_success_line).
+fn append_mtu_success_line(output_path: &str, conn: &ConnectionEntry, template: &str) {
+    if output_path.is_empty() {
+        return;
+    }
+    let line = format_mtu_line(template, conn);
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", line);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to write MTU success line to '{}': {}", output_path, e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test MTU sizes for all connections (mirrors Python test_mtu_sizes)
 // ---------------------------------------------------------------------------
 
@@ -425,6 +505,10 @@ pub async fn test_mtu_sizes(state: &Arc<ClientState>) -> Option<MtuTestResults> 
     let results: Arc<TokioMutex<Vec<(usize, ConnectionEntry)>>> =
         Arc::new(TokioMutex::new(Vec::new()));
 
+    // Resolve MTU output file path once before workers start
+    let mtu_output_path = resolve_mtu_output_path(state);
+    let mtu_file_format = state.mtu_servers_file_format.clone();
+
     let worker_count = state.mtu_test_parallelism.min(total_conns).max(1);
     let mut handles = Vec::with_capacity(worker_count);
 
@@ -437,6 +521,8 @@ pub async fn test_mtu_sizes(state: &Arc<ClientState>) -> Option<MtuTestResults> 
         let rej_up = reject_upload.clone();
         let rej_down = reject_download.clone();
         let tc = total_conns;
+        let out_path = mtu_output_path.clone();
+        let out_fmt = mtu_file_format.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -515,6 +601,9 @@ pub async fn test_mtu_sizes(state: &Arc<ClientState>) -> Option<MtuTestResults> 
                 updated_conn.download_mtu_bytes = down_mtu_bytes;
                 updated_conn.packet_loss = 0;
                 updated_conn.was_valid_once = true;
+
+                // Append to MTU success file (mirrors Python _append_mtu_success_line)
+                append_mtu_success_line(&out_path, &updated_conn, &out_fmt);
 
                 res.lock().await.push((server_id - 1, updated_conn));
             }

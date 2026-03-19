@@ -211,15 +211,21 @@ async fn handle_server_response(
     if ptype == PacketType::SOCKS5_SYN_ACK && stream_id > 0 {
         let is_fragment_ack = !data.is_empty();
         if !is_fragment_ack {
-            let mut streams = state.active_streams.lock().await;
-            if let Some(sd) = streams.get_mut(&stream_id) {
-                if let Some(arq) = &sd.arq {
-                    arq.receive_control_ack(PacketType::SOCKS5_SYN_ACK, sn).await;
+            // Extract arq + event under lock, then release lock before async calls
+            let (arq_opt, evt_opt) = {
+                let mut streams = state.active_streams.lock().await;
+                if let Some(sd) = streams.get_mut(&stream_id) {
+                    sd.status = "ACTIVE".to_string();
+                    (sd.arq.clone(), sd.handshake_event.clone())
+                } else {
+                    (None, None)
                 }
-                sd.status = "ACTIVE".to_string();
-                if let Some(evt) = &sd.handshake_event {
-                    evt.notify_one();
-                }
+            };
+            if let Some(arq) = arq_opt {
+                arq.receive_control_ack(PacketType::SOCKS5_SYN_ACK, sn).await;
+            }
+            if let Some(evt) = evt_opt {
+                evt.notify_one();
             }
         }
         queue::send_ping_packet(state);
@@ -249,11 +255,13 @@ async fn handle_server_response(
     // Control ACK types (from ARQ reliable control plane)
     // -----------------------------------------------------------------------
     if state.control_ack_types.contains(&ptype) && stream_id > 0 {
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.receive_control_ack(ptype, sn).await;
-            }
+        // Release lock before async call to avoid deadlock
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| sd.arq.clone())
+        };
+        if let Some(arq) = arq_opt {
+            arq.receive_control_ack(ptype, sn).await;
         }
         queue::send_ping_packet(state);
         return;
@@ -299,11 +307,18 @@ async fn handle_server_response(
     // STREAM_DATA_ACK — ACK from server for data we sent
     // -----------------------------------------------------------------------
     if ptype == PacketType::STREAM_DATA_ACK && stream_id > 0 {
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.receive_ack(sn).await;
-            }
+        // Release lock before async call; check status matches Python
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| {
+                match sd.status.as_str() {
+                    "ACTIVE" | "DRAINING" | "CLOSING" | "TIME_WAIT" => sd.arq.clone(),
+                    _ => None,
+                }
+            })
+        };
+        if let Some(arq) = arq_opt {
+            arq.receive_ack(sn).await;
         }
         queue::send_ping_packet(state);
         return;
@@ -313,14 +328,18 @@ async fn handle_server_response(
     // STREAM_FIN — server closing stream
     // -----------------------------------------------------------------------
     if ptype == PacketType::STREAM_FIN && stream_id > 0 {
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.mark_fin_received(sn).await;
-            }
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| sd.arq.clone())
+        };
+        if let Some(arq) = arq_opt {
+            // mark_fin_received buffers the FIN seq; write delivery loop sends FIN_ACK
+            // after draining all in-order data (mirrors Python _try_finalize_remote_eof)
+            arq.mark_fin_received(sn).await;
+        } else {
+            // No ARQ (stream not set up yet) — ACK immediately
+            queue::enqueue_packet(state, 0, stream_id, sn, PacketType::STREAM_FIN_ACK, vec![]).await;
         }
-        drop(streams);
-        queue::enqueue_packet(state, 0, stream_id, sn, PacketType::STREAM_FIN_ACK, vec![]).await;
         queue::send_ping_packet(state);
         return;
     }
@@ -329,11 +348,12 @@ async fn handle_server_response(
     // STREAM_FIN_ACK — server acknowledges our FIN
     // -----------------------------------------------------------------------
     if ptype == PacketType::STREAM_FIN_ACK && stream_id > 0 {
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.receive_control_ack(PacketType::STREAM_FIN_ACK, sn).await;
-            }
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| sd.arq.clone())
+        };
+        if let Some(arq) = arq_opt {
+            arq.receive_control_ack(PacketType::STREAM_FIN_ACK, sn).await;
         }
         queue::send_ping_packet(state);
         return;
@@ -344,13 +364,13 @@ async fn handle_server_response(
     // -----------------------------------------------------------------------
     if ptype == PacketType::STREAM_RST && stream_id > 0 {
         queue::enqueue_packet(state, 0, stream_id, sn, PacketType::STREAM_RST_ACK, vec![]).await;
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.mark_rst_received(sn).await;
-            }
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| sd.arq.clone())
+        };
+        if let Some(arq) = arq_opt {
+            arq.mark_rst_received(sn).await;
         }
-        drop(streams);
         stream::close_stream(state, stream_id, "Remote stream reset", true, true).await;
         queue::send_ping_packet(state);
         return;
@@ -360,11 +380,12 @@ async fn handle_server_response(
     // STREAM_RST_ACK — server acknowledges our RST
     // -----------------------------------------------------------------------
     if ptype == PacketType::STREAM_RST_ACK && stream_id > 0 {
-        let streams = state.active_streams.lock().await;
-        if let Some(sd) = streams.get(&stream_id) {
-            if let Some(arq) = &sd.arq {
-                arq.receive_control_ack(PacketType::STREAM_RST_ACK, sn).await;
-            }
+        let arq_opt = {
+            let streams = state.active_streams.lock().await;
+            streams.get(&stream_id).and_then(|sd| sd.arq.clone())
+        };
+        if let Some(arq) = arq_opt {
+            arq.receive_control_ack(PacketType::STREAM_RST_ACK, sn).await;
         }
         queue::send_ping_packet(state);
         return;

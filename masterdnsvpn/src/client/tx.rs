@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use crate::dns_utils::compression::{compress_payload, CompressionType};
-use crate::dns_utils::dns_enums::DnsRecordType;
+use crate::dns_utils::dns_enums::{DnsRecordType, PacketType};
 use crate::dns_utils::packet_queue::QueueItem;
 
 use super::connection;
@@ -37,6 +37,23 @@ pub async fn tx_worker(state: &Arc<ClientState>, sock: &Arc<UdpSocket>) {
                 Some(i) => i,
                 None => break,
             };
+
+            // Mirrors Python tx_worker: skip STREAM_DATA/STREAM_RESEND if sn no longer in snd_buf
+            if item.packet_type == PacketType::STREAM_DATA
+                || item.packet_type == PacketType::STREAM_RESEND
+            {
+                let arq_opt = {
+                    let streams = state.active_streams.lock().await;
+                    streams
+                        .get(&item.stream_id)
+                        .and_then(|sd| sd.arq.clone())
+                };
+                if let Some(arq) = arq_opt {
+                    if !arq.snd_buf_contains(item.sequence_num).await {
+                        continue;
+                    }
+                }
+            }
 
             if let Err(e) = send_single_packet(state, sock, &item).await {
                 tracing::debug!("TX send error: {}", e);

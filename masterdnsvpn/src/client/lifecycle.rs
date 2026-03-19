@@ -360,6 +360,11 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
     let crypto_overhead = cfg.get_i64_or("CRYPTO_OVERHEAD", 32) as usize;
     let resolver_balancing_strategy = cfg.get_i64_or("RESOLVER_BALANCING_STRATEGY", 2) as u32;
 
+    let save_mtu_servers_to_file = cfg.get_bool_or("SAVE_MTU_SERVERS_TO_FILE", false);
+    let mtu_servers_file_name = cfg.get_str_or("MTU_SERVERS_FILE_NAME", "masterdnsvpn_success_test_{time}.log");
+    let mtu_servers_file_format = cfg.get_str_or("MTU_SERVERS_FILE_FORMAT", "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}");
+    let mtu_using_separator_text = cfg.get_str_or("MTU_USING_SECTION_SEPARATOR_TEXT", "");
+
     utils::init_logger(&log_level, None, 0, 0, false);
 
     tracing::info!("Protocol: {}", protocol_type);
@@ -459,6 +464,10 @@ fn build_client_state(cfg: &HashMap<String, toml::Value>) -> Arc<ClientState> {
         mtu_test_parallelism,
         base_encode_responses,
         crypto_overhead,
+        save_mtu_servers_to_file,
+        mtu_servers_file_name,
+        mtu_servers_file_format,
+        mtu_using_separator_text,
         recheck_batch_size: AtomicUsize::new(5),
         recheck_inactive_interval_seconds: std::sync::atomic::AtomicU64::new(30),
         recheck_server_interval_seconds: std::sync::atomic::AtomicU64::new(60),
@@ -914,22 +923,39 @@ async fn handle_client_connection(
 async fn setup_arq_stream(state: Arc<ClientState>, tcp_stream: TcpStream, stream_id: u16) {
     let (reader, writer) = tcp_stream.into_split();
 
-    let initial_data = {
+    let (initial_data, pending_inbound) = {
         let streams = state.active_streams.lock().await;
-        streams
-            .get(&stream_id)
-            .map(|sd| sd.initial_payload.clone())
-            .unwrap_or_default()
+        let sd = streams.get(&stream_id);
+        (
+            sd.map(|s| s.initial_payload.clone()).unwrap_or_default(),
+            sd.map(|s| s.pending_inbound_data.clone()).unwrap_or_default(),
+        )
     };
 
     let (arq, _) = stream::create_client_arq_stream(&state, stream_id, reader, writer, initial_data, false);
 
-    // Store ARQ in stream data
-    let mut streams = state.active_streams.lock().await;
-    if let Some(sd) = streams.get_mut(&stream_id) {
-        sd.arq = Some(arq);
-        if sd.status == "PENDING" {
-            sd.status = "ACTIVE".to_string();
+    // Store ARQ in stream data and clear pending_inbound_data
+    {
+        let mut streams = state.active_streams.lock().await;
+        if let Some(sd) = streams.get_mut(&stream_id) {
+            sd.arq = Some(arq.clone());
+            sd.pending_inbound_data.clear();
+            if sd.status == "PENDING" {
+                sd.status = "ACTIVE".to_string();
+            }
+        }
+    }
+
+    // Flush any buffered inbound data (mirrors Python STREAM_SYN_ACK pending_inbound flush)
+    if !pending_inbound.is_empty() {
+        let mut sorted_keys: Vec<u16> = pending_inbound.keys().cloned().collect();
+        sorted_keys.sort();
+        for sn in sorted_keys {
+            if let Some(data) = pending_inbound.get(&sn) {
+                if !data.is_empty() {
+                    arq.receive_data_only(sn, data.clone()).await;
+                }
+            }
         }
     }
 

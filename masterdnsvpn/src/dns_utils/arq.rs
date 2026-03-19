@@ -334,8 +334,16 @@ impl Arq {
             };
             // Event-driven drain loop: wake on rcv_notify, deliver in-order rcv_buf to writer
             loop {
-                // Wait for new data signal or closed
-                rcv_notify_ref.notified().await;
+                // Drain any data already in rcv_buf before waiting for next notify.
+                // This handles data that arrived while the writer was not yet available.
+                let has_pending = {
+                    let inner = inner_ref.lock().await;
+                    inner.rcv_buf.contains_key(&inner.rcv_nxt)
+                };
+                if !has_pending {
+                    // Wait for new data signal or closed
+                    rcv_notify_ref.notified().await;
+                }
 
                 loop {
                     let (chunks, fin_done) = {
@@ -609,6 +617,13 @@ impl Arq {
     // -------------------------------------------------------------------------
     // Data plane
     // -------------------------------------------------------------------------
+
+    /// Check whether a sequence number is still in the send buffer (not yet ACKed).
+    /// Used by the TX worker to skip already-ACKed packets (mirrors Python snd_buf check).
+    pub async fn snd_buf_contains(&self, sn: u16) -> bool {
+        let sn = Self::norm_sn(sn);
+        self.inner.lock().await.snd_buf.contains_key(&sn)
+    }
 
     /// Handle inbound STREAM_DATA_ACK.
     pub async fn receive_ack(&self, sn: u16) {

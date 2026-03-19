@@ -182,6 +182,12 @@ pub struct ClientState {
     pub base_encode_responses: bool,
     pub crypto_overhead: usize,
 
+    // MTU success file output
+    pub save_mtu_servers_to_file: bool,
+    pub mtu_servers_file_name: String,
+    pub mtu_servers_file_format: String,
+    pub mtu_using_separator_text: String,
+
     // Scale profile
     pub recheck_batch_size: AtomicUsize,
     pub recheck_inactive_interval_seconds: std::sync::atomic::AtomicU64,
